@@ -1,0 +1,41 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: comex_postgres_v2
+    restart: unless-stopped
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-comex_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-comex_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-comex_fiduciary_db}
+    volumes:
+      - comex_postgres_data:/var/lib/postgresql/data
+      - ./sql/ddl:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-comex_user} -d ${POSTGRES_DB:-comex_fiduciary_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  mongodb:
+    image: mongo:7
+    container_name: comex_mongodb_v2
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_DATABASE: ${MONGO_INITDB_DATABASE:-comex_raw_lake}
+    volumes:
+      - comex_mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  comex_postgres_data:
+    driver: local
+  comex_mongo_data:
+    driver: local

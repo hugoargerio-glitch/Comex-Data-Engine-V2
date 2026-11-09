@@ -1,0 +1,32 @@
+[project]
+name = "comex-data-engine-v2"
+version = "2.0.0"
+description = "Comex Resilient Data & Fiduciary Engine V2 (HTAP: MongoDB NoSQL Landing, PostgreSQL ACID Double-Entry Ledger, FastAPI & DuckDB/Parquet OLAP)"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn>=0.28.0",
+    "pydantic>=2.5.0",
+    "pymongo>=4.6.0",
+    "psycopg[binary]>=3.1.18",
+    "sqlalchemy>=2.0.28",
+    "tenacity>=8.2.3",
+    "duckdb>=1.1.0",
+    "pyarrow>=18.0.0",
+    "requests>=2.31.0",
+    "pytest>=8.3.0",
+    "datacontract-cli>=0.10.14",
+    "httpx>=0.27.0",
+    "python-dotenv>=1.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "unit: Fast isolated tests with zero external infrastructure dependencies",
+    "integration: Live database tests requiring Docker containers (MongoDB, PostgreSQL, DuckDB)"
+]
+filterwarnings = [
+    "ignore::starlette.exceptions.StarletteDeprecationWarning"
+]

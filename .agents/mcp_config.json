@@ -1,0 +1,67 @@
+{
+  "$schema": "https://modelcontextprotocol.io/schema/mcp_config_v1.json",
+  "project": "de-agentic-boilerplate",
+  "version": "1.0.0",
+  "mcpServers": {
+    "datahub": {
+      "command": "uvx",
+      "args": [
+        "mcp-server-datahub",
+        "--gms-url",
+        "${DATAHUB_GMS_URL}",
+        "--read-only"
+      ],
+      "env": {
+        "DATAHUB_GMS_URL": "${DATAHUB_GMS_URL}",
+        "DATAHUB_GMS_TOKEN": "${DATAHUB_GMS_TOKEN}",
+        "DATAHUB_DEFAULT_ENV": "PROD"
+      },
+      "description": "DataHub Catalog MCP for live schema discovery, column-level lineage, glossary terms, and ODCS contract ownership."
+    },
+    "bruin": {
+      "command": "bruin",
+      "args": [
+        "mcp",
+        "--project-root",
+        "${WORKSPACE_ROOT}",
+        "--config-file",
+        "${WORKSPACE_ROOT}/.bruin.yml"
+      ],
+      "env": {
+        "BRUIN_ENVIRONMENT": "${BRUIN_ENVIRONMENT:-local_duckdb}",
+        "DUCKDB_PATH": "${WORKSPACE_ROOT}/local_lakehouse.duckdb"
+      },
+      "description": "Bruin MCP server governing Bronze ingestion assets, Python/PySpark execution, cross-pipeline DAG validation, and asset lineage."
+    },
+    "dbt": {
+      "command": "uvx",
+      "args": [
+        "dbt-mcp",
+        "--project-dir",
+        "${WORKSPACE_ROOT}/dbt_project",
+        "--profiles-dir",
+        "${DBT_PROFILES_DIR:-~/.dbt}"
+      ],
+      "env": {
+        "DBT_TARGET": "${DBT_TARGET:-dev_duckdb}",
+        "DBT_STATE_PATH": "${WORKSPACE_ROOT}/target/prod_manifest"
+      },
+      "description": "dbt Core MCP server strictly scoped to Silver and Gold SQL/PySpark transformations, model contracts, and state-aware builds."
+    },
+    "elementary-observability": {
+      "command": "uvx",
+      "args": [
+        "elementary-mcp",
+        "--project-dir",
+        "${WORKSPACE_ROOT}/dbt_project",
+        "--profiles-dir",
+        "${DBT_PROFILES_DIR:-~/.dbt}"
+      ],
+      "env": {
+        "EDR_ENV": "${EDR_ENV:-prod}",
+        "EDR_REPORT_PATH": "${WORKSPACE_ROOT}/target/elementary_report.json"
+      },
+      "description": "Elementary Data Observability MCP for volume/freshness anomalies, schema drift detection, and test failure telemetry."
+    }
+  }
+}

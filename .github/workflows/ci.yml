@@ -1,0 +1,47 @@
+name: Medallion OLAP & ODCS v3.2.0 Contract CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify-lakehouse-and-contracts:
+    name: Bruin (Bronze) + dbt (Silver/Gold) + ODCS v3.2.0 Gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install uv (Python 3.12 Package Manager)
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install Bruin CLI
+        run: |
+          curl -LsSf https://getbruin.com/install/cli | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Sync Virtual Environment (.venv)
+        run: uv sync --frozen
+
+      - name: Gate 1 — Validate & Execute Bronze Ingestion (Bruin)
+        run: |
+          bruin validate ./pipelines/
+          bruin run ./pipelines/
+
+      - name: Gate 2 — Build & Test Silver/Gold Models (dbt Core + DuckDB)
+        run: |
+          uv run dbt build --project-dir ./dbt_project --profiles-dir ./dbt_project
+
+      - name: Gate 3 — Verify Selective State Compilation (state:modified+)
+        run: |
+          uv run dbt compile --project-dir ./dbt_project --profiles-dir ./dbt_project --select state:modified+ --state ./target/prod_manifest
+
+      - name: Gate 4 — Lint & Execute ODCS v3.2.0 Data Contract (62 Checks)
+        run: |
+          uv run datacontract lint ./contracts/orders_silver_v1.odcs.yaml
+          uv run datacontract test ./contracts/orders_silver_v1.odcs.yaml --server local_duckdb

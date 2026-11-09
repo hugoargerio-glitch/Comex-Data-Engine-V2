@@ -1,0 +1,27 @@
+# Virtual Environments & Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local Lakehouse Databases (DuckDB & SQLite)
+*.duckdb
+*.duckdb.wal
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# dbt Artifacts & Logs (except canonical prod_manifest for state:modified+)
+dbt_project/target/
+dbt_project/logs/
+dbt_project/dbt_packages/
+
+# Environment Secrets
+.env
+.env.*
+!.env.example
+
+.bruin.yml
+logs/runs
+logs/*.log
