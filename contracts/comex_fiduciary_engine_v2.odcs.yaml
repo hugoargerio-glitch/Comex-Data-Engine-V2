@@ -1,0 +1,796 @@
+apiVersion: v3.2.0
+kind: DataContract
+id: urn:datacontract:comex:fiduciary-engine:v2
+name: comex_fiduciary_engine_v2
+version: 2.0.0
+status: active
+domain: comex_fiduciary_analytics
+dataProduct: comex_fiduciary_engine
+tenant: comex-enterprise
+description:
+  purpose: >
+    Unified multi-model data contract governing the Fiduciary Core Ledger
+    (PostgreSQL 16 ACID), the Semi-Structured Landing Zone (MongoDB 7),
+    and the Columnar Analytical Lakehouse (Apache Parquet Hive / DuckDB).
+  usage: Restricted to authorized Comex analytics, customs auditing, and fiduciary accounting reconciliations.
+  limitations: Direct UPDATE or DELETE on POSTED journal entries is strictly blocked by database triggers.
+
+context:
+  instructions: |
+    - MANDATE: Zero IEEE 754 float types across all layers; use decimal.Decimal in Python and NUMERIC(19,4)/NUMERIC(19,6) in SQL.
+    - MANDATE: Enforce 3-tier idempotency (SHA-256 edge hash, composite natural key upsert, operation_hash_id).
+    - MANDATE: Strict preservation of cleartext corporate tax IDs (CNPJ, Swiss UID) for statutory B2B audit.
+    - MANDATE: Salted cryptographic SHA-256 hashing for any natural-person PII.
+    - MANDATE: Immediate deflection of arithmetic mismatches (> 0.0001) to comex_quarantine_hitl after at most 3 agentic self-corrections.
+    - MANDATE: Closed-loop HITL quarantine promotion (APPROVED_OVERRIDE) requires strict Pydantic V2 validation and atomic double-entry posting; finalized reviews are strictly immutable.
+  verifiedStatements:
+    - id: invoice_vertical_closure
+      question: "How is the commercial invoice gross total reconciled?"
+      answer: "subtotal_amount + tax_amount + freight_amount + insurance_amount == total_amount within 0.0001 tolerance"
+      tags: ["fiduciary", "reconciliation"]
+    - id: ledger_zero_sum
+      question: "What is the fundamental double-entry invariant?"
+      answer: "SUM(debit_amount) - SUM(credit_amount) == 0.0000 across all journal lines within an entry"
+      tags: ["ledger", "acid"]
+    - id: ptax_no_lookahead
+      question: "How are weekend and holiday FX rates imputed?"
+      answer: "Strictly via Last Observation Carried Forward (LOCF) from the preceding business day without lookahead bias"
+      tags: ["fx", "ptax"]
+    - id: unmasked_corporate_tax_id
+      question: "Why are corporate CNPJ and Swiss UID retained in cleartext?"
+      answer: "They are public legal entities required for statutory customs audit and natural-key upsert deduplication"
+      tags: ["b2b", "compliance"]
+    - id: ledger_immutability
+      question: "How are posted accounting errors corrected in the ledger?"
+      answer: "Exclusively via reversal entries (create_reversal_entry) preserving the immutable audit trail"
+      tags: ["audit", "ledger"]
+    - id: icms_calculo_por_dentro
+      question: "How is ICMS calculated on Brazilian customs nationalization?"
+      answer: "ICMS is calculated 'por dentro' where the tax base is grossed up: (VA + II + IPI + PIS + COFINS + Siscomex + AFRMM) / (1 - icms_rate), and ICMS = base * icms_rate"
+      tags: ["customs", "tax", "icms"]
+    - id: cpc16_inventory_segregation
+      question: "How are import duties and taxes accounted for under CPC 16 (IAS 2)?"
+      answer: "Non-recoverable taxes (II, Siscomex, AFRMM) are capitalized into inventory landed cost, while recoverable taxes (IPI, PIS, COFINS, ICMS under Lucro Real) are segregated into recoverable tax assets"
+      tags: ["cpc16", "fiduciary", "inventory"]
+    - id: hitl_quarantine_immutability
+      question: "Can a finalized HITL quarantine record be modified or re-resolved?"
+      answer: "Finalized quarantine records (APPROVED_OVERRIDE or REJECTED) are strictly immutable; attempts to re-resolve raise an immediate conflict exception"
+      tags: ["quarantine", "hitl", "governance"]
+  constraints:
+    - id: monetary_precision
+      constraint: "All monetary amounts must use DECIMAL(19,4) and BIGINT scaled cents."
+    - id: fx_precision
+      constraint: "All FX exchange rates must use DECIMAL(19,6)."
+    - id: rounding_tolerance
+      constraint: "Maximum permitted reconciliation rounding delta is 0.0001."
+
+servers:
+  - server: postgres_fiduciary_prod
+    type: postgres
+    environment: prod
+    host: localhost
+    port: 5432
+    database: comex_fiduciary_db
+    schema: public
+    description: "PostgreSQL 16 ACID Transactional Fiduciary Database"
+  - server: mongodb_landing_zone
+    type: custom
+    environment: prod
+    host: localhost
+    port: 27017
+    database: comex_raw_lake
+    description: "MongoDB 7 Semi-Structured Landing Zone (Raw BSON Lake)"
+  - server: duckdb_lakehouse_olap
+    type: custom
+    environment: prod
+    path: /data/lakehouse/comex_analytics.duckdb
+    description: "Apache Parquet Hive Partitioned Lakehouse with DuckDB Engine"
+
+slaProperties:
+  - property: latency
+    value: 15m
+  - property: availability
+    value: 99.9%
+  - property: retention
+    value: "7 years (Statutory tax and customs audit requirement)"
+
+customProperties:
+  - property: architectureProfile
+    value: "Profile 2: Hybrid HTAP & Fiduciary Medallion"
+  - property: landingZone
+    value: "MongoDB 7 (comex_raw_lake)"
+  - property: operationalLedger
+    value: "PostgreSQL 16 (comex_fiduciary_db)"
+  - property: analyticalLakehouse
+    value: "Apache Parquet Hive / DuckDB"
+
+schema:
+  - name: commercial_invoices
+    physicalName: commercial_invoices
+    physicalType: table
+    description: International Commercial Invoices operational ledger with atomic upsert and vertical closure.
+    properties:
+      - name: invoice_id
+        logicalType: string
+        physicalType: uuid
+        primaryKey: true
+        required: true
+        unique: true
+        description: Surrogate system UUID generated upon invoice ingestion.
+      - name: issuer_tax_id
+        logicalType: string
+        physicalType: varchar(50)
+        required: true
+        description: B2B corporate tax identifier (Brazilian CNPJ 14-digit Modulo 11 or Swiss UID CHE-XXX.XXX.XXX).
+        tags: ["B2B", "StatutoryAudit", "CleartextCorporateTaxID"]
+      - name: document_number
+        logicalType: string
+        physicalType: varchar(100)
+        required: true
+        description: Canonical commercial invoice serial / invoice number emitted by the supplier.
+      - name: issue_date
+        logicalType: date
+        physicalType: date
+        required: true
+        description: Official issuance date stated on the commercial invoice.
+      - name: currency_code
+        logicalType: string
+        physicalType: char(3)
+        required: true
+        enum:
+          - value: "USD"
+          - value: "EUR"
+          - value: "CHF"
+          - value: "BRL"
+        description: ISO 4217 three-letter currency code of the invoice.
+      - name: subtotal_amount
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: Net merchandise amount before tax, freight, and insurance.
+      - name: tax_amount
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: Explicit local/export tax amount levied on the invoice.
+      - name: freight_amount
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: International or inland logistics freight cost declared on the invoice.
+      - name: insurance_amount
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: Transport cargo insurance cost declared on the invoice.
+      - name: total_amount
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: Gross total invoice amount payable by the importer.
+      - name: subtotal_amount_cents
+        logicalType: integer
+        physicalType: bigint
+        required: true
+        description: Integer cents representation of subtotal_amount (amount * 10000).
+      - name: tax_amount_cents
+        logicalType: integer
+        physicalType: bigint
+        required: true
+        description: Integer cents representation of tax_amount (amount * 10000).
+      - name: freight_amount_cents
+        logicalType: integer
+        physicalType: bigint
+        required: true
+        description: Integer cents representation of freight_amount (amount * 10000).
+      - name: insurance_amount_cents
+        logicalType: integer
+        physicalType: bigint
+        required: true
+        description: Integer cents representation of insurance_amount (amount * 10000).
+      - name: total_amount_cents
+        logicalType: integer
+        physicalType: bigint
+        required: true
+        description: Integer cents representation of total_amount (amount * 10000).
+      - name: incoterm
+        logicalType: string
+        physicalType: varchar(3)
+        required: true
+        enum:
+          - value: "EXW"
+          - value: "FOB"
+          - value: "CIF"
+          - value: "DDP"
+        description: Standard ICC Incoterm 2020 governing logistics and risk transfer.
+      - name: extraction_confidence
+        logicalType: number
+        physicalType: numeric(5,4)
+        required: true
+        description: Confidence score (0.0000 to 1.0000) assigned by the structured extractor.
+      - name: raw_payload_hash
+        logicalType: string
+        physicalType: char(64)
+        required: true
+        description: Hexadecimal SHA-256 fingerprint of the raw ingested document payload.
+      - name: mongo_raw_id
+        logicalType: string
+        physicalType: varchar(64)
+        required: false
+        description: Origin BSON ObjectId linking to raw_commercial_invoices in MongoDB comex_raw_lake.
+      - name: created_at
+        logicalType: timestamp
+        physicalType: timestamptz
+        required: true
+        description: UTC system ingestion timestamp.
+      - name: updated_at
+        logicalType: timestamp
+        physicalType: timestamptz
+        required: true
+        description: UTC timestamp of latest state update.
+
+  - name: journal_entries
+    physicalName: journal_entries
+    physicalType: table
+    description: Canonical header for the Append-Only Double-Entry Fiduciary Ledger.
+    properties:
+      - name: entry_id
+        logicalType: string
+        physicalType: uuid
+        primaryKey: true
+        required: true
+        unique: true
+        description: Deterministic UUID identifying the accounting entry.
+      - name: transaction_date
+        logicalType: date
+        physicalType: date
+        required: true
+        description: Date when the financial event was executed or booked.
+      - name: competence_date
+        logicalType: date
+        physicalType: date
+        required: true
+        description: Accounting competence date matching the invoice/customs clearance date.
+      - name: reference_document_id
+        logicalType: string
+        physicalType: varchar(100)
+        required: false
+        description: External reference identifier (Invoice, DUIMP, SWIFT end_to_end_id).
+      - name: description
+        logicalType: string
+        physicalType: text
+        required: true
+        description: Statutory narrative describing the commercial event.
+      - name: status
+        logicalType: string
+        physicalType: varchar(20)
+        required: true
+        enum:
+          - value: "POSTED"
+          - value: "REVERSED"
+        description: Posting lifecycle status. POSTED entries are immutable.
+      - name: reversed_from_entry_id
+        logicalType: string
+        physicalType: uuid
+        required: false
+        description: Self-referential UUID pointing to the original entry when status is REVERSED.
+      - name: created_at
+        logicalType: timestamp
+        physicalType: timestamptz
+        required: true
+        description: UTC system creation timestamp.
+
+  - name: journal_lines
+    physicalName: journal_lines
+    physicalType: table
+    description: Immutable double-entry ledger lines with zero-sum invariant in functional currency.
+    properties:
+      - name: line_id
+        logicalType: string
+        physicalType: uuid
+        primaryKey: true
+        required: true
+        unique: true
+        description: Primary key UUID for the journal line.
+      - name: entry_id
+        logicalType: string
+        physicalType: uuid
+        required: true
+        description: Foreign key pointing to journal_entries.entry_id.
+      - name: account_code
+        logicalType: string
+        physicalType: varchar(50)
+        required: true
+        description: Chart of Accounts canonical code.
+      - name: debit_amount
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: Debit value in functional currency (BRL). Strictly non-negative.
+      - name: credit_amount
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: Credit value in functional currency (BRL). Strictly non-negative.
+      - name: currency_code
+        logicalType: string
+        physicalType: char(3)
+        required: true
+        description: Original transaction currency code before functional conversion.
+      - name: original_currency_amount
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: Nominal amount denominated in the original foreign currency.
+      - name: exchange_rate_applied
+        logicalType: number
+        physicalType: numeric(19,6)
+        required: true
+        description: Exact FX conversion rate applied (PTAX or Spot) with 6 decimal places.
+      - name: line_order
+        logicalType: integer
+        physicalType: int
+        required: true
+        description: Sequence index (1, 2, ... N) of the line within the journal entry.
+      - name: created_at
+        logicalType: timestamp
+        physicalType: timestamptz
+        required: true
+        description: UTC system creation timestamp.
+
+  - name: comex_quarantine_hitl
+    physicalName: comex_quarantine_hitl
+    physicalType: table
+    description: Operational quarantine and human-in-the-loop queue for schema drift and validation failures.
+    properties:
+      - name: quarantine_id
+        logicalType: string
+        physicalType: uuid
+        primaryKey: true
+        required: true
+        unique: true
+        description: Primary key UUID for the quarantined record.
+      - name: source_type
+        logicalType: string
+        physicalType: varchar(50)
+        required: true
+        enum:
+          - value: "INVOICE"
+          - value: "MDIC_BATCH"
+          - value: "SWIFT_STATEMENT"
+        description: Source pipeline generating the quarantined payload.
+      - name: raw_payload_hash
+        logicalType: string
+        physicalType: char(64)
+        required: true
+        description: Hexadecimal SHA-256 fingerprint of the rejected payload.
+      - name: mongo_raw_id
+        logicalType: string
+        physicalType: varchar(64)
+        required: false
+        description: ObjectId pointer to MongoDB raw collection for visual audit via Compass.
+      - name: validation_errors
+        logicalType: object
+        physicalType: jsonb
+        required: true
+        description: Structured JSON array of Pydantic V2 ValidationError details.
+      - name: self_correction_attempts
+        logicalType: integer
+        physicalType: int
+        required: true
+        description: Number of autonomous LLM self-correction loops attempted prior to quarantine routing.
+      - name: review_status
+        logicalType: string
+        physicalType: varchar(30)
+        required: true
+        enum:
+          - value: "PENDING_REVIEW"
+          - value: "APPROVED_OVERRIDE"
+          - value: "REJECTED"
+        description: Human reviewer lifecycle status.
+      - name: reviewed_by
+        logicalType: string
+        physicalType: varchar(100)
+        required: false
+        description: Email or username of the fiduciary auditor resolving the quarantine.
+      - name: reviewed_at
+        logicalType: timestamp
+        physicalType: timestamptz
+        required: false
+        description: UTC timestamp when the review action occurred.
+      - name: created_at
+        logicalType: timestamp
+        physicalType: timestamptz
+        required: true
+        description: UTC timestamp when the record entered quarantine.
+
+  - name: dim_merchandise_ncm
+    physicalName: dim_merchandise_ncm
+    physicalType: table
+    description: Mercosul Common Nomenclature (NCM) merchandise dimension table.
+    properties:
+      - name: ncm_code
+        logicalType: string
+        physicalType: varchar(8)
+        required: true
+        primaryKey: true
+        unique: true
+        description: Mercosul Common Nomenclature 8-digit tariff code.
+      - name: hs_code
+        logicalType: string
+        physicalType: varchar(6)
+        required: true
+        description: Harmonized System 6-digit heading/subheading code.
+      - name: description
+        logicalType: string
+        physicalType: text
+        required: true
+        description: Official Portuguese description of the NCM commodity.
+      - name: unit_measure
+        logicalType: string
+        physicalType: varchar(30)
+        required: true
+        description: Statistical standard unit of measurement (e.g., KG, UNID, LITRO).
+      - name: created_at
+        logicalType: timestamp
+        physicalType: timestamptz
+        required: true
+        description: UTC system creation timestamp.
+
+  - name: dim_partner_country
+    physicalName: dim_partner_country
+    physicalType: table
+    description: Partner country dimension conforming to MDIC codes and ISO 3166-1.
+    properties:
+      - name: country_code
+        logicalType: integer
+        physicalType: int
+        required: true
+        primaryKey: true
+        unique: true
+        description: Official MDIC partner country numeric identifier.
+      - name: country_iso3
+        logicalType: string
+        physicalType: char(3)
+        required: true
+        description: ISO 3166-1 alpha-3 three-letter country abbreviation.
+      - name: country_name
+        logicalType: string
+        physicalType: varchar(100)
+        required: true
+        description: Standard Portuguese country name.
+      - name: economic_block
+        logicalType: string
+        physicalType: varchar(50)
+        required: false
+        description: Economic or regional trade bloc (e.g., MERCOSUL, UE, NAFTA, ALADI).
+      - name: created_at
+        logicalType: timestamp
+        physicalType: timestamptz
+        required: true
+        description: UTC system creation timestamp.
+
+  - name: dim_currency_ptax
+    physicalName: dim_currency_ptax
+    physicalType: table
+    description: Daily official foreign exchange dimension with Last Observation Carried Forward (LOCF).
+    properties:
+      - name: date_id
+        logicalType: integer
+        physicalType: int
+        required: true
+        description: Integer foreign key linking to dim_date in YYYYMMDD format.
+      - name: currency_code
+        logicalType: string
+        physicalType: char(3)
+        required: true
+        enum:
+          - value: "USD"
+          - value: "EUR"
+          - value: "CHF"
+        description: ISO 4217 foreign currency identifier.
+      - name: ptax_buy_rate
+        logicalType: number
+        physicalType: numeric(19,6)
+        required: true
+        description: Official BACEN Olinda buying exchange rate with 6 decimal places.
+      - name: ptax_sell_rate
+        logicalType: number
+        physicalType: numeric(19,6)
+        required: true
+        description: Official BACEN Olinda selling exchange rate with 6 decimal places.
+      - name: is_business_day
+        logicalType: boolean
+        physicalType: boolean
+        required: true
+        description: True if official BACEN market quotation was published on this calendar date.
+      - name: is_interpolated_locf
+        logicalType: boolean
+        physicalType: boolean
+        required: true
+        description: True if rate was forward-filled from the previous business day without lookahead bias.
+      - name: created_at
+        logicalType: timestamp
+        physicalType: timestamptz
+        required: true
+        description: UTC system creation timestamp.
+
+  - name: fact_comex_operations
+    physicalName: fact_comex_operations
+    physicalType: table
+    description: Analytical grain representing monthly aggregated customs declarations from MDIC.
+    properties:
+      - name: operation_hash_id
+        logicalType: string
+        physicalType: char(64)
+        required: true
+        primaryKey: true
+        unique: true
+        description: Deterministic SHA-256 natural key hash over year, month, type, NCM, country, UF, modal, URF.
+      - name: date_id
+        logicalType: integer
+        physicalType: int
+        required: true
+        description: FK to dim_date (YYYYMM01 representing the statistical reference month).
+      - name: operation_type
+        logicalType: string
+        physicalType: varchar(10)
+        required: true
+        enum:
+          - value: "IMPORT"
+          - value: "EXPORT"
+        description: Customs flow direction.
+      - name: ncm_code
+        logicalType: string
+        physicalType: varchar(8)
+        required: true
+        description: Mercosul Common Nomenclature 8-digit tariff code.
+      - name: country_code
+        logicalType: integer
+        physicalType: int
+        required: true
+        description: Partner country code conforming to MDIC country table and ISO 3166.
+      - name: uf_code
+        logicalType: string
+        physicalType: char(2)
+        required: true
+        description: Brazilian federated state (UF) of fiscal domicile or clearance port.
+      - name: modal_code
+        logicalType: integer
+        physicalType: int
+        required: true
+        description: Transport modal code (e.g., 1=Maritime, 4=Air, 7=Road).
+      - name: urf_code
+        logicalType: integer
+        physicalType: int
+        required: true
+        description: Federal Revenue Customs Clearance Unit (Unidade da Receita Federal).
+      - name: statistical_quantity
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: Physical statistical quantity declared in standard metric units.
+      - name: net_weight_kg
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: Net cargo weight expressed in kilograms.
+      - name: fob_amount_usd
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: Free On Board export/import value in United States Dollars.
+      - name: freight_amount_usd
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: International freight cost portion in United States Dollars.
+      - name: insurance_amount_usd
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: International cargo insurance portion in United States Dollars.
+      - name: cif_amount_usd
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: Cost, Insurance, and Freight cumulative value in United States Dollars.
+      - name: landed_cost_brl
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: Total internalized inventory landed cost in Brazilian Reais.
+      - name: created_at
+        logicalType: timestamp
+        physicalType: timestamptz
+        required: true
+        description: UTC system creation timestamp.
+
+  - name: customs_nationalizations
+    physicalName: customs_nationalizations
+    physicalType: table
+    description: Brazilian Customs Nationalizations operational and fiduciary ledger with cascading duties and CPC 16 accounting.
+    properties:
+      - name: nationalization_id
+        logicalType: string
+        physicalType: uuid
+        primaryKey: true
+        required: true
+        unique: true
+        description: Surrogate system UUID generated upon customs declaration registration.
+      - name: declaration_number
+        logicalType: string
+        physicalType: varchar(50)
+        required: true
+        unique: true
+        description: Canonical Brazilian customs declaration number (DI e.g. 26/1948201-3 or Duimp 26BR00008491).
+      - name: registration_date
+        logicalType: date
+        physicalType: date
+        required: true
+        description: Official SISCOMEX customs declaration registration date.
+      - name: clearance_date
+        logicalType: date
+        physicalType: date
+        required: true
+        description: Customs clearance date (Desembaraço Aduaneiro) marking competence and inventory transfer.
+      - name: invoice_id
+        logicalType: string
+        physicalType: uuid
+        required: false
+        description: Foreign key linking to the source commercial invoice in commercial_invoices.
+      - name: importer_tax_id
+        logicalType: string
+        physicalType: varchar(50)
+        required: true
+        description: Brazilian corporate tax identifier (CNPJ 14-digit) of the legal importer of record.
+      - name: tax_regime
+        logicalType: string
+        physicalType: varchar(20)
+        required: true
+        enum:
+          - value: "LUCRO_REAL"
+          - value: "LUCRO_PRESUMIDO"
+          - value: "SIMPLES_NACIONAL"
+          - value: "CUSTO_INTEGRAL"
+        description: Corporate tax regime determining tax recoverability under CPC 16 (IAS 2).
+      - name: currency_code
+        logicalType: string
+        physicalType: char(3)
+        required: true
+        enum:
+          - value: "USD"
+          - value: "EUR"
+          - value: "CHF"
+          - value: "BRL"
+        description: Foreign currency code used on the commercial invoice and customs invoice line.
+      - name: fob_amount
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: Free On Board merchandise amount in foreign currency.
+      - name: freight_amount
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: International logistics freight cost in foreign currency.
+      - name: insurance_amount
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: International cargo insurance cost in foreign currency.
+      - name: cif_amount
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: Cost, Insurance, and Freight amount in foreign currency (FOB + Freight + Insurance).
+      - name: ptax_exchange_rate
+        logicalType: number
+        physicalType: numeric(19,6)
+        required: true
+        description: Official SISCOMEX customs conversion exchange rate (PTAX) with 6 decimal places.
+      - name: customs_value_brl
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: Customs Value in functional currency BRL (Valor Aduaneiro = CIF * PTAX).
+      - name: ii_rate
+        logicalType: number
+        physicalType: numeric(7,4)
+        required: true
+        description: Import Duty nominal tax rate (Imposto de Importação).
+      - name: ii_amount_brl
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: Import Duty payable in BRL (Valor Aduaneiro * ii_rate).
+      - name: ipi_rate
+        logicalType: number
+        physicalType: numeric(7,4)
+        required: true
+        description: Excise Tax nominal rate (Imposto sobre Produtos Industrializados).
+      - name: ipi_amount_brl
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: Excise Tax payable in BRL ((Valor Aduaneiro + II) * ipi_rate).
+      - name: pis_rate
+        logicalType: number
+        physicalType: numeric(7,4)
+        required: true
+        description: PIS-Importação contribution nominal rate (statutory standard 0.0210).
+      - name: pis_amount_brl
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: PIS-Importação payable in BRL (Valor Aduaneiro * pis_rate).
+      - name: cofins_rate
+        logicalType: number
+        physicalType: numeric(7,4)
+        required: true
+        description: COFINS-Importação contribution nominal rate (statutory standard 0.0965).
+      - name: cofins_amount_brl
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: COFINS-Importação payable in BRL (Valor Aduaneiro * cofins_rate).
+      - name: siscomex_fee_brl
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: Fixed SISCOMEX customs declaration registration utilization fee in BRL.
+      - name: afrmm_brl
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: Additional Merchant Marine Freight Renewal Tax (AFRMM) in BRL for maritime modal.
+      - name: icms_rate
+        logicalType: number
+        physicalType: numeric(7,4)
+        required: true
+        description: State Value Added Tax rate (ICMS por dentro standard e.g. 0.1800).
+      - name: icms_base_brl
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: Grossed-up ICMS tax base por dentro ((VA + II + IPI + PIS + COFINS + Siscomex + AFRMM) / (1 - icms_rate)).
+      - name: icms_amount_brl
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: State ICMS payable in BRL (icms_base_brl * icms_rate).
+      - name: total_taxes_brl
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: Cumulative customs duties and taxes payable on import clearance.
+      - name: landed_cost_brl
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: Total gross internalized landed cost in BRL (customs_value_brl + total_taxes_brl).
+      - name: net_inventory_cost_brl
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: Net asset inventory valuation under CPC 16 (excluding recoverable tax credits).
+      - name: recoverable_taxes_brl
+        logicalType: number
+        physicalType: numeric(19,4)
+        required: true
+        description: Recoverable tax asset under Lucro Real (IPI + PIS + COFINS + ICMS).
+      - name: journal_entry_id
+        logicalType: string
+        physicalType: uuid
+        required: false
+        description: Identifier of the 4-legged double-entry posting in journal_entries.
+      - name: created_at
+        logicalType: timestamp
+        physicalType: timestamptz
+        required: true
+        description: System UTC creation timestamp.
+      - name: updated_at
+        logicalType: timestamp
+        physicalType: timestamptz
+        required: true
+        description: System UTC update timestamp.

@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import duckdb
 import pyarrow as pa
 import pyarrow.dataset as ds
@@ -16,13 +16,14 @@ def get_duckdb_connection() -> duckdb.DuckDBPyConnection:
 def write_records_to_parquet_hive(
     records: List[Dict[str, Any]], 
     table_name: str,
-    partition_cols: List[str] = ["year", "month"]
+    partition_cols: List[str] = ["year", "month"],
+    schema: Optional[pa.Schema] = None
 ) -> None:
     """Serializa dicionários em Apache Parquet (Snappy) com particionamento Hive."""
     if not records:
         return
         
-    table = pa.Table.from_pylist(records)
+    table = pa.Table.from_pylist(records, schema=schema) if schema is not None else pa.Table.from_pylist(records)
     output_dir = Path(PARQUET_BASE_DIR) / table_name
     output_dir.mkdir(parents=True, exist_ok=True)
 

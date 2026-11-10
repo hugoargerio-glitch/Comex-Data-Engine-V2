@@ -1,0 +1,87 @@
+apiVersion: v3.2.0
+kind: DataContract
+id: urn:datacontract:de-agentic-boilerplate-htap:canonical_document_v1
+name: canonical_document_v1
+version: 1.0.0
+status: active
+domain: enterprise_htap
+dataProduct: multi_model_data_platform
+tenant: enterprise-platform
+description:
+  purpose: >
+    Canonical data contract governing the dual-store HTAP pipeline: raw landing in MongoDB 7
+    (NoSQL Document Store) and transactional persistence in PostgreSQL 16 with Decimal precision.
+
+context:
+  instructions: |
+    - MANDATE: Persist external raw payloads directly to MongoDB before relational normalization.
+    - MANDATE: Enforce strict DECIMAL(19,4) numeric precision for all monetary values (zero float).
+    - MANDATE: Maintain dual idempotency (SHA-256 payload hash + natural key UPSERT).
+  verifiedStatements:
+    - id: net_amount_reconciliation
+      question: "How is net_amount reconciled?"
+      answer: "net_amount = gross_amount - deduction_amount"
+      tags: ["reconciliation", "htap"]
+  constraints:
+    - id: natural_key_uniqueness
+      constraint: "Tuple (entity_code, reference_date, currency_code) must be unique."
+      tags: ["grain", "hard_block"]
+
+servers:
+  - server: local_postgres
+    type: postgres
+    environment: dev
+    host: localhost
+    port: 5432
+    database: htap_database
+    schema: public
+  - server: local_mongodb
+    type: custom
+    environment: dev
+    host: localhost
+    port: 27017
+    database: htap_raw_lake
+
+schema:
+  - name: canonical_records
+    physicalName: canonical_records
+    physicalType: table
+    description: "PostgreSQL 16 relational table containing validated transactional records."
+    properties:
+      - name: record_id
+        logicalType: string
+        physicalType: UUID
+        primaryKey: true
+        required: true
+      - name: entity_code
+        logicalType: string
+        physicalType: VARCHAR(100)
+        required: true
+      - name: reference_date
+        logicalType: date
+        physicalType: DATE
+        required: true
+      - name: currency_code
+        logicalType: string
+        physicalType: CHAR(3)
+        required: true
+      - name: gross_amount
+        logicalType: number
+        physicalType: DECIMAL(19,4)
+        required: true
+      - name: deduction_amount
+        logicalType: number
+        physicalType: DECIMAL(19,4)
+        required: true
+      - name: net_amount
+        logicalType: number
+        physicalType: DECIMAL(19,4)
+        required: true
+      - name: mongo_raw_id
+        logicalType: string
+        physicalType: VARCHAR(64)
+        required: true
+      - name: raw_payload_hash
+        logicalType: string
+        physicalType: CHAR(64)
+        required: true

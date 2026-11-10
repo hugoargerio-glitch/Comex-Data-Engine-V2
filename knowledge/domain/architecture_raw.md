@@ -1,3 +1,4 @@
+
 ---
 type: arquitetura-raw
 area: tecnologia/engenharia-de-dados

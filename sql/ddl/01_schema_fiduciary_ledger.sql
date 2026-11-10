@@ -63,7 +63,10 @@ INSERT INTO accounts (account_code, account_name, account_type, normal_balance) 
 ('4.1.2.01', 'Despesas Bancárias e Tarifas SWIFT', 'EXPENSE', 'DEBIT'),
 ('4.1.3.01', 'Variação Cambial Passiva (Realized FX Loss)', 'EXPENSE', 'DEBIT'),
 ('3.1.2.01', 'Variação Cambial Ativa (Realized FX Gain)', 'REVENUE', 'CREDIT'),
-('4.1.4.01', 'Despesas Tributárias e Aduaneiras (IOF / Impostos)', 'EXPENSE', 'DEBIT')
+('4.1.4.01', 'Despesas Tributárias e Aduaneiras (IOF / Impostos)', 'EXPENSE', 'DEBIT'),
+('1.1.3.02', 'Estoques de Mercadorias Nacionalizadas (Disponível)', 'ASSET', 'DEBIT'),
+('1.1.4.01', 'Tributos a Recuperar - IPI/PIS/COFINS/ICMS sobre Importação', 'ASSET', 'DEBIT'),
+('2.1.2.01', 'Obrigações Tributárias e Aduaneiras a Recolher (DARF/GNRE)', 'LIABILITY', 'CREDIT')
 ON CONFLICT (account_code) DO NOTHING;
 
 -- 4. Cabeçalho de Lançamentos Contábeis (Append-Only Journal Entries)
@@ -115,3 +118,87 @@ CREATE TABLE IF NOT EXISTS comex_quarantine_hitl (
 );
 
 CREATE INDEX IF NOT EXISTS idx_quarantine_status ON comex_quarantine_hitl(review_status);
+
+
+-- 7. Trigger de Imutabilidade Fiduciária (Append-Only Ledger)
+CREATE OR REPLACE FUNCTION fn_enforce_append_only_ledger()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_TABLE_NAME = 'journal_lines' THEN
+        RAISE EXCEPTION 'Fiduciary Ledger Violation: journal_lines is strictly append-only. Use create_reversal_entry() to post a compensating entry.';
+    ELSIF TG_TABLE_NAME = 'journal_entries' THEN
+        IF TG_OP = 'DELETE' THEN
+            RAISE EXCEPTION 'Fiduciary Ledger Violation: Deleting journal entries is strictly prohibited.';
+        ELSIF TG_OP = 'UPDATE' THEN
+            IF OLD.status = 'POSTED' AND NOT (NEW.status = 'REVERSED' AND NEW.reversed_from_entry_id IS NOT NULL) THEN
+                RAISE EXCEPTION 'Fiduciary Ledger Violation: POSTED journal entries are immutable and cannot be updated.';
+            END IF;
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_enforce_append_only_lines ON journal_lines;
+CREATE TRIGGER trg_enforce_append_only_lines
+BEFORE UPDATE OR DELETE ON journal_lines
+FOR EACH ROW
+EXECUTE FUNCTION fn_enforce_append_only_ledger();
+
+DROP TRIGGER IF EXISTS trg_enforce_append_only_entries ON journal_entries;
+CREATE TRIGGER trg_enforce_append_only_entries
+BEFORE UPDATE OR DELETE ON journal_entries
+FOR EACH ROW
+EXECUTE FUNCTION fn_enforce_append_only_ledger();
+
+-- 8. Tabela de Nacionalizações Aduaneiras e Desembaraço (Customs Nationalizations)
+CREATE TABLE IF NOT EXISTS customs_nationalizations (
+    nationalization_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    declaration_number VARCHAR(50) NOT NULL UNIQUE,
+    registration_date DATE NOT NULL,
+    clearance_date DATE NOT NULL,
+    invoice_id UUID REFERENCES commercial_invoices(invoice_id),
+    importer_tax_id VARCHAR(50) NOT NULL,
+    tax_regime VARCHAR(20) NOT NULL CHECK (tax_regime IN ('LUCRO_REAL', 'LUCRO_PRESUMIDO', 'SIMPLES_NACIONAL', 'CUSTO_INTEGRAL')),
+    currency_code CHAR(3) NOT NULL CHECK (currency_code IN ('USD', 'EUR', 'CHF', 'BRL')),
+    fob_amount NUMERIC(19, 4) NOT NULL,
+    freight_amount NUMERIC(19, 4) NOT NULL,
+    insurance_amount NUMERIC(19, 4) NOT NULL,
+    cif_amount NUMERIC(19, 4) NOT NULL,
+    ptax_exchange_rate NUMERIC(19, 6) NOT NULL,
+    customs_value_brl NUMERIC(19, 4) NOT NULL,
+    ii_rate NUMERIC(7, 4) NOT NULL,
+    ii_amount_brl NUMERIC(19, 4) NOT NULL,
+    ipi_rate NUMERIC(7, 4) NOT NULL,
+    ipi_amount_brl NUMERIC(19, 4) NOT NULL,
+    pis_rate NUMERIC(7, 4) NOT NULL,
+    pis_amount_brl NUMERIC(19, 4) NOT NULL,
+    cofins_rate NUMERIC(7, 4) NOT NULL,
+    cofins_amount_brl NUMERIC(19, 4) NOT NULL,
+    siscomex_fee_brl NUMERIC(19, 4) NOT NULL DEFAULT 0.0000,
+    afrmm_brl NUMERIC(19, 4) NOT NULL DEFAULT 0.0000,
+    icms_rate NUMERIC(7, 4) NOT NULL,
+    icms_base_brl NUMERIC(19, 4) NOT NULL,
+    icms_amount_brl NUMERIC(19, 4) NOT NULL,
+    total_taxes_brl NUMERIC(19, 4) NOT NULL,
+    landed_cost_brl NUMERIC(19, 4) NOT NULL,
+    net_inventory_cost_brl NUMERIC(19, 4) NOT NULL,
+    recoverable_taxes_brl NUMERIC(19, 4) NOT NULL DEFAULT 0.0000,
+    journal_entry_id UUID REFERENCES journal_entries(entry_id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT chk_total_taxes_closure CHECK (
+        ABS(total_taxes_brl - (ii_amount_brl + ipi_amount_brl + pis_amount_brl + cofins_amount_brl + siscomex_fee_brl + afrmm_brl + icms_amount_brl)) <= 0.0001
+    ),
+    CONSTRAINT chk_landed_cost_closure CHECK (
+        ABS(landed_cost_brl - (customs_value_brl + total_taxes_brl)) <= 0.0001
+    ),
+    CONSTRAINT chk_net_inventory_cost CHECK (
+        ABS(landed_cost_brl - (net_inventory_cost_brl + recoverable_taxes_brl)) <= 0.0001
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_customs_nat_reg_date ON customs_nationalizations(registration_date);
+CREATE INDEX IF NOT EXISTS idx_customs_nat_invoice_id ON customs_nationalizations(invoice_id);
+CREATE INDEX IF NOT EXISTS idx_customs_nat_journal_id ON customs_nationalizations(journal_entry_id);
+
