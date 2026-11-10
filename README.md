@@ -18,7 +18,7 @@ Engineered under a **Spec-Driven Agentic Data Engineering** paradigm, every inge
 
 Traditional foreign trade and cross-border bookkeeping architectures fail across two opposing fault lines:
 1. **Purely Analytical Batch Pipelines (Legacy ETL)**: Ingest raw foreign trade CSVs (such as Brazilian **MDIC Comex Stat**) using IEEE 754 binary floating-point types (`float` / `DOUBLE PRECISION`) that silently corrupt multi-currency reconciliations by fractions of a cent, while ignoring the transactional lifecycle of **Commercial Invoices**, **Incoterms 2020**, and **SWIFT** bank settlements.
-2. **Purely Transactional CRUD Systems (Isolated ERPs)**: Mutate account balances destructively in place (`UPDATE accounts SET balance = ...`), erasing statutory audit trails, failing to segregate competence vs. cash foreign exchange variance ($\Delta_{\text{FX}}$), and lacking columnar OLAP throughput to analyze millions of Harmonized System (**HS / NCM**) customs declarations.
+2. **Purely Transactional CRUD Systems (Isolated ERPs)**: Mutate account balances destructively in place (`UPDATE accounts SET balance = ...`), erasing statutory audit trails, failing to segregate competence vs. cash foreign exchange variance, and lacking columnar OLAP throughput to analyze millions of Harmonized System (**HS / NCM**) customs declarations.
 
 **Comex Data Engine V2** bridges both worlds via a **Multi-Model HTAP & Fiduciary Medallion Architecture**:
 
@@ -26,11 +26,11 @@ Traditional foreign trade and cross-border bookkeeping architectures fail across
 | :--- | :--- | :--- |
 | **Workload Topology** | Isolated CSV batch scripts on disk | **Tri-Store HTAP**: **MongoDB 7** (Raw BSON Landing) + **PostgreSQL 16** (ACID Double-Entry Ledger) + **DuckDB / Parquet Hive** (Vectorized OLAP Star Schema) |
 | **Monetary & FX Arithmetic** | Binary floating-point (`float` IEEE 754) | **Strict Anti-Float Shield**: `Decimal("0.0001")` (`NUMERIC(19,4)`) for currency, `Decimal("0.000001")` (`NUMERIC(19,6)`) for FX rates, and `BIGINT` scaled cents |
-| **Idempotency Guarantee** | Blind file overwrite or duplicate inserts | **Triple-Barrier Idempotency ($f(f(x)) = f(x)$)**: Edge `SHA-256` payload registry + PostgreSQL composite natural-key `ON CONFLICT` upsert + deterministic `operation_hash_id` |
-| **Bookkeeping & Audit Trail** | Destructive `UPDATE` / `DELETE` on balances | **Append-Only Double-Entry Ledger**: Zero-sum invariant ($\sum \text{Debit} - \sum \text{Credit} = 0.0000$), PL/pgSQL immutability trigger, and statutory **Reversal Entries** |
+| **Idempotency Guarantee** | Blind file overwrite or duplicate inserts | **Triple-Barrier Idempotency (f(f(x)) = f(x))**: Edge `SHA-256` payload registry + PostgreSQL composite natural-key `ON CONFLICT` upsert + deterministic `operation_hash_id` |
+| **Bookkeeping & Audit Trail** | Destructive `UPDATE` / `DELETE` on balances | **Append-Only Double-Entry Ledger**: Zero-sum invariant (`SUM(Debit) - SUM(Credit) == 0.0000`), PL/pgSQL immutability trigger, and statutory **Reversal Entries** |
 | **Cross-Border Tax & FX Rules** | Hardcoded flat percentages, missing weekend rates | **Live BACEN Olinda PTAX** with **LOCF Forward-Fill** (`USD`, `EUR`, `CHF`), **Swiss UID (`CHE-XXX.XXX.XXX MWST`)** & **Brazilian CNPJ (Mod-11)** validation, and **Brazilian Cascading Customs Taxes (ICMS "Por Dentro" & CPC 16 / IAS 2)** |
 | **Network & Extraction Resilience** | Naive fixed-interval retries or hard crashes | **`tenacity` Exponential Backoff + Full Jitter** for external APIs + **3-Iteration Agentic Self-Correction Loop** reinjecting structured Pydantic V2 tracebacks |
-| **Exception & Anomaly Handling** | Silent data truncation or pipeline crash (`exit 1`) | **Closed-Loop HITL Quarantine (`comex_quarantine_hitl`)**: Finite state machine (`PENDING_REVIEW` $\rightarrow$ `APPROVED_OVERRIDE` / `REJECTED`) with atomic ledger promotion |
+| **Exception & Anomaly Handling** | Silent data truncation or pipeline crash (`exit 1`) | **Closed-Loop HITL Quarantine (`comex_quarantine_hitl`)**: Finite state machine (`PENDING_REVIEW` -> `APPROVED_OVERRIDE` / `REJECTED`) with atomic ledger promotion |
 
 ---
 
@@ -39,34 +39,34 @@ Traditional foreign trade and cross-border bookkeeping architectures fail across
 ```mermaid
 flowchart TD
     subgraph L1["1. EXTERNAL SOURCES & CROSS-BORDER PAYLOADS"]
-        S1["MDIC Comex Stat Open Data<br/>(Bulk IMP/EXP CSVs: NCM, FOB, Freight, Insurance)"]
-        S2["BACEN Olinda OData API<br/>(Official PTAX t1 vs. Spot t2: USD, EUR, CHF, BRL)"]
-        S3["Commercial Invoices & SWIFT camt.053<br/>(Brazilian CNPJ Mod-11 & Swiss UID CHE-MWST)"]
+        S1["MDIC Comex Stat Open Data<br/>Bulk IMP/EXP CSVs: NCM, FOB, Freight, Insurance"]
+        S2["BACEN Olinda OData API<br/>Official PTAX: USD, EUR, CHF, BRL"]
+        S3["Commercial Invoices & SWIFT camt.053<br/>Brazilian CNPJ Mod-11 & Swiss UID CHE-MWST"]
     end
 
     subgraph L2["2. RESILIENT INGESTION & NOSQL LANDING ZONE (MongoDB 7 — Port 27018)"]
-        S1 & S2 --> ING["Resilient Extractors (src/extractors/)<br/>Tenacity Exponential Backoff + Full Jitter + Offline Fallback"]
+        S1 & S2 --> ING["Resilient Extractors (src/extractors/)<br/>Tenacity Jitter + Offline Fallback"]
         S3 --> API["FastAPI Deterministic Edge (src/api/main.py)<br/>POST /api/v2/invoices/ingest & /reconcile-swift"]
-        API --> SHA["Barrier 1 — Edge Idempotency:<br/>SHA-256 Payload Fingerprint (ingestion_idempotency_registry)"]
-        SHA -->|Schema-on-Read BSON| MGO["🍃 MongoDB 7 (comex_raw_lake)<br/>• raw_commercial_invoices<br/>• raw_swift_statements<br/>• raw_mdic_declarations"]
-        MGO --> LOOP["Agentic Self-Correction Loop<br/>(Reinjects Pydantic V2 ValidationError up to 3x)"]
+        API --> SHA["Barrier 1 — Edge Idempotency:<br/>SHA-256 Payload Fingerprint"]
+        SHA -->|Schema-on-Read BSON| MGO["MongoDB 7 (comex_raw_lake)<br/>• raw_commercial_invoices<br/>• raw_swift_statements<br/>• raw_mdic_declarations"]
+        MGO --> LOOP["Agentic Self-Correction Loop<br/>Reinjects Pydantic V2 Traceback up to 3x"]
     end
 
     subgraph L3["3. SHIFT-LEFT DATA CONTRACTS & PYDANTIC V2 SHIELD (ODCS v3.2.0)"]
-        ING & LOOP --> PYD["Pydantic V2 & ODCS v3.2.0 Contract Guards<br/>• Strict Float Rejection -> Decimal('0.0001') ROUND_HALF_UP<br/>• Horizontal & Vertical Math Closure (Subtotal + Tax + Freight + Ins == Total)<br/>• Incoterms 2020 (EXW, FOB, CIF, DDP) & Salted SHA-256 Natural PII"]
-        PYD -->|Math Drift / Unresolved Schema Error| HITL["🚨 Closed-Loop HITL Quarantine (comex_quarantine_hitl)<br/>State: PENDING_REVIEW -> APPROVED_OVERRIDE | REJECTED<br/>Preserves mongo_raw_id for Forensic Audit"]
+        ING & LOOP --> PYD["Pydantic V2 & ODCS v3.2.0 Contract Guards<br/>• Strict Float Rejection -> Decimal(0.0001)<br/>• Horizontal & Vertical Math Closure<br/>• Incoterms 2020 (EXW, FOB, CIF, DDP) & Salted SHA-256 PII"]
+        PYD -->|Math Drift / Validation Error| HITL["Closed-Loop HITL Quarantine (comex_quarantine_hitl)<br/>State: PENDING_REVIEW -> APPROVED_OVERRIDE | REJECTED"]
     end
 
     subgraph L4["4. FIDUCIARY OLTP & CUSTOMS TAX ENGINE (PostgreSQL 16 ACID — Port 5434)"]
-        PYD -->|Validated Payload| UPS["Barrier 2 — Relational Idempotency:<br/>Atomic Upsert on Composite Natural Key<br/>GREATEST(extraction_confidence)"]
-        HITL -->|POST /api/v2/quarantine/{id}/resolve| UPS
-        UPS --> TAX["Customs & FX Domain Engine (src/models/customs.py)<br/>• Cascading Taxes: VA -> II -> IPI -> PIS/COFINS -> ICMS 'Por Dentro'<br/>• CPC 16 / IAS 2 Inventory Split (LUCRO_REAL vs. CUSTO_INTEGRAL)<br/>• SWIFT camt.053 3-Legged Fee Split & FX Variance (PTAX t1 vs. Spot t2)"]
-        TAX --> LED["Immutable Double-Entry Ledger<br/>Tables: accounts, journal_entries, journal_lines<br/>PL/pgSQL Trigger: Blocks UPDATE/DELETE on POSTED entries<br/>ACID Invariant: SUM(debit_amount) - SUM(credit_amount) == 0.0000"]
+        PYD -->|Validated Payload| UPS["Barrier 2 — Relational Idempotency:<br/>Atomic Upsert on Composite Natural Key"]
+        HITL -->|"Resolve: APPROVED_OVERRIDE"| UPS
+        UPS --> TAX["Customs & FX Domain Engine (src/models/customs.py)<br/>• Cascading Taxes: VA -> II -> IPI -> PIS/COFINS -> ICMS<br/>• CPC 16 / IAS 2 Inventory Split (LUCRO_REAL vs. CUSTO_INTEGRAL)<br/>• SWIFT camt.053 3-Legged Fee Split"]
+        TAX --> LED["Immutable Double-Entry Ledger<br/>Tables: accounts, journal_entries, journal_lines<br/>PL/pgSQL Trigger: Blocks UPDATE/DELETE on POSTED<br/>ACID Invariant: SUM(Debit) - SUM(Credit) == 0"]
     end
 
     subgraph L5["5. VECTORIZED OLAP LAKEHOUSE (Apache Parquet Hive + DuckDB)"]
-        PYD & TAX -->|PyArrow Streaming & Snappy Compression| PARQ["Parquet Hive Lakehouse (data/parquet_lakehouse/)<br/>Partitioned by year=YYYY/month=MM — decimal128(19,4) & (19,6)"]
-        PARQ & LED --> DUCK["🦆 DuckDB Analytical Star Schema<br/>• fact_comex_operations (8-Key Canonical Grain)<br/>• dim_currency_ptax (365-Day LOCF Forward-Filled)<br/>• dim_merchandise_ncm, dim_partner_country, dim_date"]
+        PYD & TAX -->|PyArrow Streaming Snappy| PARQ["Parquet Hive Lakehouse (data/parquet_lakehouse/)<br/>Partitioned by year=YYYY/month=MM"]
+        PARQ & LED --> DUCK["DuckDB Analytical Star Schema<br/>• fact_comex_operations (8-Key Grain)<br/>• dim_currency_ptax (365-Day LOCF)<br/>• dim_merchandise_ncm, dim_partner_country, dim_date"]
     end
 
     classDef source fill:#1e293b,stroke:#0f172a,stroke-width:2px,color:#fff;
@@ -90,57 +90,82 @@ flowchart TD
 
 ### 3.1 Strict Anti-Float Monetary Precision & Cross-Border Fiscal Validation
 In international trade and fiduciary accounting, binary floating-point numbers (`float` IEEE 754, where `0.1 + 0.2 == 0.30000000000000004`) are strictly forbidden because they introduce penny drift across multi-million-dollar currency conversions and cascading tax allocations.
+
 - **Anti-Float Guardrail ([`src/models/invoices.py`](./src/models/invoices.py), [`src/models/customs.py`](./src/models/customs.py))**: Any `float` instance passed to a monetary or exchange-rate field raises an immediate `ValueError("IEEE 754 float is strictly prohibited...")`. All monetary measures are quantized to `Decimal("0.0001")` (`NUMERIC(19,4)`) using `ROUND_HALF_UP` and mirrored as integer scaled cents (`BIGINT = amount * 10000`). Exchange rates are quantized to `Decimal("0.000001")` (`NUMERIC(19,6)`).
-- **Horizontal & Vertical Invoice Closure**:
-  - **Horizontal Line Math**: Every `CommercialInvoiceLine` verifies $\text{ROUND}(\text{quantity} \times \text{unit\_price}, 4) == \text{total\_price}$.
-  - **Vertical Header Closure**: Verifies $\sum \text{line.total\_price} == \text{subtotal\_amount}$ and:
-    $$\text{subtotal\_amount} + \text{tax\_amount} + \text{freight\_amount} + \text{insurance\_amount} == \text{total\_amount}$$
+
+- **Horizontal & Vertical Invoice Math Closure**:
+  ```text
+  Horizontal Line Math:   ROUND(quantity * unit_price, 4) == total_price
+  Line Aggregation:       SUM(line.total_price) == subtotal_amount
+  Vertical Header Closure: subtotal_amount + tax_amount + freight_amount + insurance_amount == total_amount
+  ```
   - **Incoterms 2020 Semantics**: Under `CIF` (*Cost, Insurance, and Freight*), explicit non-zero `freight_amount` is mandatory to prevent customs under-valuation (*Subfaturamento de Valor Aduaneiro*).
+
 - **Transnational Tax ID & PII Governance**:
   - **Cleartext B2B Corporate Tax IDs**: Validates 14-digit **Brazilian CNPJ** (Modulo-11 check digits) and **Swiss Corporate UID** (`^CHE-\d{3}\.\d{3}\.\d{3}(\s?(MWST|TVA|IVA))?$`), preserving them in cleartext for statutory customs traceability and natural-key deduplication.
-  - **Salted SHA-256 Natural-Person PII**: Hashes individual personal data (`contact_email` $\rightarrow$ `contact_email_hash`) with a cryptographic salt before persistence.
+  - **Salted SHA-256 Natural-Person PII**: Hashes individual personal data (`contact_email` -> `contact_email_hash`) with a cryptographic salt before persistence.
+
+---
 
 ### 3.2 Append-Only Double-Entry Fiduciary Ledger & Database Triggers
 All validated financial events (invoice recognition, customs nationalization, and SWIFT bank settlement) are recorded in PostgreSQL 16 ([`sql/ddl/01_schema_fiduciary_ledger.sql`](./sql/ddl/01_schema_fiduciary_ledger.sql)):
-- **Zero-Sum Accounting Identity**: Every `journal_entry` requires $N \ge 2$ rows in `journal_lines` (at least one debit leg and one credit leg) satisfying:
-  $$\sum_{i=1}^{k} \text{debit\_amount}_i - \sum_{j=1}^{m} \text{credit\_amount}_j = 0.0000$$
-- **Database-Enforced Immutability**: A PostgreSQL PL/pgSQL trigger (`trg_journal_lines_immutable` / `prevent_journal_mutation()`) intercepts and aborts any `UPDATE` or `DELETE` statement against `POSTED` ledger records (`RAISE EXCEPTION 'Append-Only Violation: journal_lines cannot be updated or deleted...'`).
+
+- **Zero-Sum Accounting Identity**: Every `journal_entry` requires at least two lines ($N \ge 2$) satisfying the fundamental zero-sum invariant:
+  ```text
+  SUM(debit_amount) - SUM(credit_amount) == 0.0000  (max tolerance ±0.0001)
+  ```
+- **Database-Enforced Immutability**: A PostgreSQL PL/pgSQL trigger (`trg_journal_lines_immutable` / `prevent_journal_mutation()`) intercepts and aborts any `UPDATE` or `DELETE` statement against `POSTED` ledger records:
+  ```sql
+  RAISE EXCEPTION 'Append-Only Violation: journal_lines cannot be updated or deleted. Use statutory reversal entries (create_reversal_entry).';
+  ```
 - **Statutory Reversals (*Estorno Contábil*)**: Operational corrections are executed exclusively via `create_reversal_entry()`, which posts a new compensating `journal_entry` with inverted debit/credit legs referencing `reversed_from_entry_id`.
+
+---
 
 ### 3.3 Live BACEN Olinda PTAX Connector, LOCF Forward-Fill & SWIFT `camt.053` Reconciliation
 Implemented in [`src/extractors/bacen_ptax_client.py`](./src/extractors/bacen_ptax_client.py) and [`src/models/customs.py`](./src/models/customs.py):
+
 - **Resilient Central Bank Extraction**: Queries the official **Banco Central do Brasil (BACEN) Olinda OData API** (`CotacaoMoedaPeriodo`) for `USD`, `EUR`, and `CHF` using `tenacity` exponential backoff with full jitter ($T_{\text{sleep}} \sim \mathcal{U}(0, \min(60, 2^n))$), with deterministic offline fallback to [`samples/bacen_ptax_sample.json`](./samples/bacen_ptax_sample.json).
 - **Zero-Lookahead LOCF Forward-Fill (`apply_locf_forward_fill`)**: Because central banks do not publish exchange rates on weekends or national holidays while customs shipments occur 365 days a year, calendar gaps are filled strictly using **Last Observation Carried Forward (LOCF)** from the immediately preceding business day (`is_interpolated_locf = TRUE`), preventing lookahead bias.
 - **Competence ($t_1$) vs. Cash Settlement ($t_2$) & SWIFT Fee Split (`build_swift_fee_split_entry`)**:
   - Reconciles ISO 20022 `camt.053` international wire statements where intermediary correspondent banks deduct wire fees ($10–$50 under `SHA`/`BEN` clauses).
   - Generates a balanced **3-Legged Split Journal Entry** in functional currency (`BRL`):
-    1. **Debit**: `1.1.1.01` (*Banco Conta Movimento — Câmbio*) for Net Cash Received ($\text{Net} \times \text{Rate}$).
-    2. **Debit**: `4.1.2.01` (*Despesas Bancárias e Tarifas SWIFT*) for Deducted Wire Fee ($\text{Fee} \times \text{Rate}$).
-    3. **Credit**: `1.1.2.01` (*Clientes no Exterior / Contas a Receber*) for Gross Invoice Nominal Amount ($\text{Gross} \times \text{Rate}$).
+    1. **Debit**: `1.1.1.01` (*Banco Conta Movimento — Câmbio*) for Net Cash Received (`Net * Rate`).
+    2. **Debit**: `4.1.2.01` (*Despesas Bancárias e Tarifas SWIFT*) for Deducted Wire Fee (`Fee * Rate`).
+    3. **Credit**: `1.1.2.01` (*Clientes no Exterior / Contas a Receber*) for Gross Invoice Nominal Amount (`Gross * Rate`).
+
+---
 
 ### 3.4 Brazilian Customs Cascading Tax Engine & CPC 16 (IAS 2) Inventory Valuation
 Implemented in [`src/models/customs.py`](./src/models/customs.py) (`compute_brazilian_landed_cost` & `build_import_nationalization_ledger_entry`):
-1. **Customs Value (*Valor Aduaneiro* — $\text{VA}_{\text{BRL}}$)**:
-   $$\text{VA}_{\text{BRL}} = \text{ROUND}\left((\text{FOB}_{\text{USD}} + \text{Freight}_{\text{USD}} + \text{Insurance}_{\text{USD}}) \times \text{PTAX}_{\text{sell}}, \, 4\right)$$
-2. **Import Duty (*Imposto de Importação* — $\text{II}$)**:
-   $$\text{II}_{\text{BRL}} = \text{ROUND}\left(\text{VA}_{\text{BRL}} \times \text{Alíquota}_{\text{II}}, \, 4\right)$$
-3. **Industrialized Products Tax (*IPI*)**:
-   $$\text{IPI}_{\text{BRL}} = \text{ROUND}\left((\text{VA}_{\text{BRL}} + \text{II}_{\text{BRL}}) \times \text{Alíquota}_{\text{IPI}}, \, 4\right)$$
-4. **PIS & COFINS-Importação**:
-   $$\text{PIS}_{\text{BRL}} = \text{ROUND}\left(\text{VA}_{\text{BRL}} \times \text{Alíquota}_{\text{PIS}}, \, 4\right), \quad \text{COFINS}_{\text{BRL}} = \text{ROUND}\left(\text{VA}_{\text{BRL}} \times \text{Alíquota}_{\text{COFINS}}, \, 4\right)$$
-5. **ICMS Importação ("Cálculo por Dentro" Gross-Up)**:
-   In Brazil, ICMS is included in its own tax base alongside all federal duties and customs fees (*Taxa Siscomex* + *AFRMM*):
-   $$\text{ICMS Base}_{\text{BRL}} = \text{ROUND}\left(\frac{\text{VA}_{\text{BRL}} + \text{II}_{\text{BRL}} + \text{IPI}_{\text{BRL}} + \text{PIS}_{\text{BRL}} + \text{COFINS}_{\text{BRL}} + \text{Siscomex}_{\text{BRL}} + \text{AFRMM}_{\text{BRL}}}{1 - \text{Alíquota}_{\text{ICMS}}}, \, 4\right)$$
-   $$\text{ICMS}_{\text{BRL}} = \text{ROUND}\left(\text{ICMS Base}_{\text{BRL}} \times \text{Alíquota}_{\text{ICMS}}, \, 4\right)$$
-6. **CPC 16 (R1) / IAS 2 Inventory Cost Segregation**:
-   - **`LUCRO_REAL` (Non-Cumulative Regime)**: Capitalizes only non-recoverable duties into merchandise inventory (`1.1.3.02`: $\text{VA} + \text{II} + \text{Siscomex} + \text{AFRMM}$) and segregates recoverable taxes (`IPI + PIS + COFINS + ICMS`) into `1.1.4.01` (*Tributos a Recuperar*).
-   - **`CUSTO_INTEGRAL` (Cumulative Regime)**: Capitalizes 100% of cascading taxes directly into inventory cost (`1.1.3.02`).
+
+#### Statutory Brazilian Import Tax Cascade (Sequential Execution)
+```text
+1. Customs Value (VA):   VA_BRL     = ROUND((FOB_USD + Freight_USD + Insurance_USD) * PTAX_sell, 4)
+2. Import Duty (II):      II_BRL     = ROUND(VA_BRL * Aliq_II, 4)
+3. Industrial Tax (IPI):  IPI_BRL    = ROUND((VA_BRL + II_BRL) * Aliq_IPI, 4)
+4. PIS Importação:        PIS_BRL    = ROUND(VA_BRL * Aliq_PIS, 4)
+5. COFINS Importação:     COFINS_BRL = ROUND(VA_BRL * Aliq_COFINS, 4)
+6. ICMS Base (Gross-Up):  Base_ICMS  = ROUND((VA_BRL + II_BRL + IPI_BRL + PIS_BRL + COFINS_BRL + Siscomex + AFRMM) / (1 - Aliq_ICMS), 4)
+7. ICMS Importação:       ICMS_BRL   = ROUND(Base_ICMS * Aliq_ICMS, 4)
+8. Total Taxes:           Taxes_BRL  = II_BRL + IPI_BRL + PIS_BRL + COFINS_BRL + Siscomex + AFRMM + ICMS_BRL
+9. Total Landed Cost:     Landed_BRL = VA_BRL + Taxes_BRL
+```
+
+- **ICMS "Cálculo por Dentro"**: In Brazil, ICMS is statutory grossed-up by dividing by `(1 - Aliq_ICMS)` so that ICMS itself is included in its own taxable base alongside all federal duties and customs fees (*Taxa Siscomex* + *AFRMM*).
+- **CPC 16 (R1) / IAS 2 Inventory Cost Segregation**:
+  - **`LUCRO_REAL` (Non-Cumulative Regime)**: Capitalizes only non-recoverable duties into merchandise inventory (`1.1.3.02`: `VA + II + Siscomex + AFRMM`) and segregates recoverable taxes (`IPI + PIS + COFINS + ICMS`) into `1.1.4.01` (*Tributos a Recuperar*).
+  - **`CUSTO_INTEGRAL` (Cumulative Regime)**: Capitalizes 100% of cascading taxes directly into inventory cost (`1.1.3.02`).
+
+---
 
 ### 3.5 Bulk MDIC Comex Stat Streaming & Canonical 8-Key Pre-Aggregation
 Implemented in [`src/extractors/mdic_bulk_loader.py`](./src/extractors/mdic_bulk_loader.py):
 - Streams official federal trade CSVs (`IMP_YYYY.csv` / `EXP_YYYY.csv`), supporting both 11-column and 12-column (`CO_UNID`) layouts.
 - **Canonical 8-Key Pre-Aggregation**: Aggregates rows sharing the natural tuple `(year, month, operation_type, ncm_code, country_code, uf_code, modal_code, urf_code)` across differing statistical units (`CO_UNID`) before computing the deterministic 64-char SHA-256 `operation_hash_id`.
 - **Early-Arriving Dimensions Defense**: Automatically upserts missing keys into `dim_date`, `dim_merchandise_ncm`, and `dim_partner_country` prior to fact table insertion, preventing foreign-key rollbacks during asynchronous bulk loads.
+
+---
 
 ### 3.6 Closed-Loop HITL Quarantine & Spec-Driven Multi-Agent Governance
 Implemented in [`src/pipeline/comex_processor.py`](./src/pipeline/comex_processor.py) and governed by [`AGENTS.md`](./AGENTS.md):
@@ -280,7 +305,7 @@ Start the server via `make run-api`:
 | :--- | :--- | :--- |
 | `GET /health` | Multi-model architecture readiness check | Confirms HTAP runtime status |
 | `POST /api/v2/invoices/ingest` | Ingests cross-border Commercial Invoices | Computes `SHA-256` hash, lands raw BSON in MongoDB, runs 3x self-correction loop, upserts into PostgreSQL + Ledger or routes to `comex_quarantine_hitl` (`HTTP 422`) |
-| `POST /api/v2/ledger/reconcile-swift` | Reconciles ISO 20022 `camt.053` wire statements | Rejects `float`, computes 3-legged SWIFT fee split entry ($\sum D - \sum C = 0.0000$) |
+| `POST /api/v2/ledger/reconcile-swift` | Reconciles ISO 20022 `camt.053` wire statements | Rejects `float`, computes 3-legged SWIFT fee split entry (Debit == Credit) |
 | `POST /api/v2/analytics/landed-cost-sim` | Simulates or persists Brazilian Import Nationalization | Computes `VA`, `II`, `IPI`, `PIS`, `COFINS`, grossed-up `ICMS "por dentro"`, and books 4-legged `CPC 16` journal entry (`persist=true/false`) |
 | `GET /api/v2/quarantine/pending` | Lists quarantined payloads by review status | Returns `quarantine_id`, `mongo_raw_id`, and structured validation errors |
 | `POST /api/v2/quarantine/{id}/resolve` | Closed-loop HITL quarantine resolution | Enforces finite state machine (`HTTP 409` if already resolved); promotes `APPROVED_OVERRIDE` atomically to `commercial_invoices` + `journal_lines` |
@@ -295,14 +320,14 @@ Start the server via `make run-api`:
 2. **DuckDB OLAP Lakehouse (DBeaver)**:
    - Open `./data/comex_lakehouse.duckdb` and execute [`sql/queries/00_init_duckdb_views.sql`](./sql/queries/00_init_duckdb_views.sql) once to register views over `./data/parquet_lakehouse/*`.
 3. **MongoDB 7 (MongoDB Compass)**:
-   - **URI**: `mongodb://localhost:27018` $\rightarrow$ Database `comex_raw_lake` $\rightarrow$ Collection `raw_commercial_invoices` (or run [`playgrounds/quickstart_comex.mongodb.js`](./playgrounds/quickstart_comex.mongodb.js)).
+   - **URI**: `mongodb://localhost:27018` -> Database `comex_raw_lake` -> Collection `raw_commercial_invoices` (or run [`playgrounds/quickstart_comex.mongodb.js`](./playgrounds/quickstart_comex.mongodb.js)).
 
 ### Pre-Built SQL Audit & Forensics Suite ([`sql/queries/`](./sql/queries/))
 
 | SQL Script | Audit / Analytical Objective | Verified Invariant |
 | :--- | :--- | :--- |
 | [`00_init_duckdb_views.sql`](./sql/queries/00_init_duckdb_views.sql) | Binds DuckDB views (`dim_currency_ptax`, `fact_comex_operations`) to Hive Parquet partitions | Columnar `DECIMAL(19,4)` / `DECIMAL(19,6)` schema fidelity |
-| [`01_audit_trial_balance_zero_sum.sql`](./sql/queries/01_audit_trial_balance_zero_sum.sql) | Audits General Ledger Trial Balance (*Balancete de Verificação*) across all entries | $\sum \text{Debit} - \sum \text{Credit} = 0.0000$ (`PASS — ZERO SUM`) |
+| [`01_audit_trial_balance_zero_sum.sql`](./sql/queries/01_audit_trial_balance_zero_sum.sql) | Audits General Ledger Trial Balance (*Balancete de Verificação*) across all entries | `SUM(Debit) - SUM(Credit) == 0.0000` (`PASS — ZERO SUM`) |
 | [`02_sabotage_test_append_only_trigger.sql`](./sql/queries/02_sabotage_test_append_only_trigger.sql) | Attempts unauthorized `UPDATE` and `DELETE` on posted `journal_lines` | PL/pgSQL trigger aborts mutation with statutory error |
 | [`03_fx_and_swift_reconciliation_audit.sql`](./sql/queries/03_fx_and_swift_reconciliation_audit.sql) | Inspects weekend LOCF forward-fill on `CHF`/`EUR`/`USD` and 3-legged SWIFT fee split | Zero lookahead bias & balanced wire fee deduction |
 | [`04_analytical_landed_cost_by_ncm.sql`](./sql/queries/04_analytical_landed_cost_by_ncm.sql) | Star Schema OLAP query joining facts with NCM and Partner Country dimensions | Freight/insurance ratios & BRL landed cost by NCM |
