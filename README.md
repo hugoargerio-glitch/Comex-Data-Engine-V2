@@ -6,11 +6,11 @@
 [![PostgreSQL 16](https://img.shields.io/badge/PostgreSQL_16-ACID_Fiduciary_Ledger-336791?style=flat-square&logo=postgresql&logoColor=white)](./sql/ddl/01_schema_fiduciary_ledger.sql)
 [![MongoDB 7](https://img.shields.io/badge/MongoDB_7-NoSQL_Landing_Zone-47A248?style=flat-square&logo=mongodb&logoColor=white)](./playgrounds/quickstart_comex.mongodb.js)
 [![DuckDB | Parquet](https://img.shields.io/badge/OLAP_Lakehouse-DuckDB_%7C_Parquet_Hive-FFF000?style=flat-square&logo=duckdb&logoColor=black)](./src/connectors/lakehouse.py)
-[![Agentic Governance](https://img.shields.io/badge/Agentic_Harness-Spec--Driven_ODCS_%26_OKF-8B5CF6?style=flat-square)](./AGENTS.md)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](LICENSE)
 
 **Comex Data Engine V2** is an enterprise-grade **Hybrid Transactional/Analytical Processing (HTAP)** and **Fiduciary Accounting Engine** purpose-built for international trade (**COMEX**), multi-currency foreign exchange reconciliation (**CHF, EUR, USD, BRL**), **ISO 20022 SWIFT (`camt.053`)** wire settlement, and **Brazilian Customs Nationalization (*Cálculo de Impostos Aduaneiros em Cascata & CPC 16 / IAS 2*)**.
 
-Engineered under a **Spec-Driven Agentic Data Engineering** paradigm, every ingestion pipeline, accounting entry, and analytical transformation is governed by executable **Open Data Contract Standard (ODCS v3.2.0)** specifications, paired **Open Knowledge Format (OKF)** domain mandates, strict **No-Float (`Decimal`)** arithmetic, database-level **PL/pgSQL immutability triggers**, and a closed-loop **Human-in-the-Loop (HITL) Quarantine** workflow.
+Engineered under a **Spec-Driven Data Engineering** paradigm, every ingestion pipeline, accounting entry, and analytical transformation is governed by executable **Open Data Contract Standard (ODCS v3.2.0)** specifications, paired **Open Knowledge Format (OKF)** domain mandates, strict **No-Float (`Decimal`)** arithmetic, database-level **PL/pgSQL immutability triggers**, and a closed-loop **Human-in-the-Loop (HITL) Quarantine** workflow.
 
 ---
 
@@ -170,15 +170,11 @@ Implemented in [`src/extractors/mdic_bulk_loader.py`](./src/extractors/mdic_bulk
 
 ---
 
-### 3.6 Closed-Loop HITL Quarantine & Spec-Driven Multi-Agent Governance
-Implemented in [`src/pipeline/comex_processor.py`](./src/pipeline/comex_processor.py) and governed by [`AGENTS.md`](./AGENTS.md):
+### 3.6 Closed-Loop HITL Quarantine & Autonomous Incident Triage
+Implemented in [`src/pipeline/comex_processor.py`](./src/pipeline/comex_processor.py):
 - **Finite State Machine (`comex_quarantine_hitl`)**: Invoices failing mathematical closure or Incoterm rules after 3 self-correction attempts are routed to `PENDING_REVIEW` with their `mongo_raw_id` and structured Pydantic error tree.
 - **Audited Resolution (`resolve_quarantined_invoice`)**: Human auditors inspect the raw payload in MongoDB Compass and submit a resolution via `POST /api/v2/quarantine/{id}/resolve`. Under `APPROVED_OVERRIDE`, the corrected payload is re-validated against `CommercialInvoiceInput`, atomically upserted into `commercial_invoices`, booked into the double-entry ledger, and stamped with `reviewed_by` and `reviewed_at` (`HTTP 409 Conflict` blocks any subsequent mutation).
-- **Least-Privilege Specialist Subagents ([`.claude/agents/`](./.claude/agents/))**:
-  - [`planner.md`](./.claude/agents/planner.md): Read-Only Architect enforcing the 6-Point Fitness Gate and drafting ODCS v3.2.0 contracts.
-  - [`worker.md`](./.claude/agents/worker.md): Pipeline & API developer operating under strict No-Float and ACID rules.
-  - [`auditor.md`](./.claude/agents/auditor.md): Read-Only Quality Auditor verifying 5 deterministic gates (ODCS Lint, Anti-Fanout, Decimal FinOps, Idempotency, PII Hashing).
-  - [`dataops.md`](./.claude/agents/dataops.md): Incident triage specialist generating deterministic RCA post-mortems ([`INC-2026-11-10-001_quarantine_triage.md`](./knowledge/runbooks/INC-2026-11-10-001_quarantine_triage.md)).
+- **Automated Incident Post-Mortem & RCA**: The engine generates deterministic RCA post-mortems ([`INC-2026-11-10-001_quarantine_triage.md`](./knowledge/runbooks/INC-2026-11-10-001_quarantine_triage.md)) following structured decision trees for compliance auditability.
 
 ---
 
@@ -186,12 +182,10 @@ Implemented in [`src/pipeline/comex_processor.py`](./src/pipeline/comex_processo
 
 ```text
 comex-data-engine-v2/
-├── AGENTS.md                                      # Canonical runtime constitution & multi-agent governance
 ├── Makefile                                       # Deterministic CLI targets (setup, up, seed, fetch-ptax, fetch-mdic, verify)
 ├── docker-compose.yml                             # Container orchestration: PostgreSQL 16 (5434) & MongoDB 7 (27018)
 ├── pyproject.toml                                 # Python 3.12+ dependency lock (FastAPI, Pydantic V2, DuckDB, PyArrow, Tenacity)
 ├── .env.example                                   # Environment configuration template
-├── .claude/agents/                                # Least-privilege specialist subagents (planner, worker, auditor, dataops)
 ├── contracts/
 │   ├── canonical_document_v1.odcs.yaml            # Base HTAP ODCS v3.2.0 contract
 │   └── comex_fiduciary_engine_v2.odcs.yaml        # Executable Comex V2 ODCS v3.2.0 contract (Invoices, Ledger, Taxes, Star Schema)
