@@ -1,0 +1,163 @@
+[
+  {
+    "issuer_tax_id": "33.000.167/0001-01",
+    "document_number": "INV-2026-001",
+    "issue_date": "2026-11-06",
+    "currency_code": "USD",
+    "subtotal_amount": "50000.0000",
+    "tax_amount": "0.0000",
+    "freight_amount": "0.0000",
+    "insurance_amount": "0.0000",
+    "total_amount": "50000.0000",
+    "incoterm": "FOB",
+    "extraction_confidence": "0.9950",
+    "lines": [
+      {
+        "line_number": 1,
+        "ncm_code": "84713012",
+        "description": "Laptops corporativos de alta performance",
+        "quantity": "50.0000",
+        "unit_price": "1000.0000",
+        "total_price": "50000.0000"
+      }
+    ]
+  },
+  {
+    "issuer_tax_id": "CHE-116.281.710 MWST",
+    "document_number": "INV-2026-002",
+    "issue_date": "2026-11-06",
+    "currency_code": "CHF",
+    "subtotal_amount": "120000.0000",
+    "tax_amount": "0.0000",
+    "freight_amount": "4500.0000",
+    "insurance_amount": "500.0000",
+    "total_amount": "125000.0000",
+    "incoterm": "CIF",
+    "extraction_confidence": "0.9800",
+    "lines": [
+      {
+        "line_number": 1,
+        "ncm_code": "30049099",
+        "description": "Medicamentos e princípios ativos biotecnológicos",
+        "quantity": "100.0000",
+        "unit_price": "1200.0000",
+        "total_price": "120000.0000"
+      }
+    ]
+  },
+  {
+    "issuer_tax_id": "11.222.333/0001-81",
+    "document_number": "INV-2026-003",
+    "issue_date": "2026-11-07",
+    "currency_code": "EUR",
+    "subtotal_amount": "75000.0000",
+    "tax_amount": "1500.0000",
+    "freight_amount": "3000.0000",
+    "insurance_amount": "500.0000",
+    "total_amount": "80000.0000",
+    "incoterm": "DDP",
+    "extraction_confidence": "0.9700",
+    "lines": [
+      {
+        "line_number": 1,
+        "ncm_code": "85171300",
+        "description": "Smartphones e dispositivos de conectividade 5G",
+        "quantity": "150.0000",
+        "unit_price": "500.0000",
+        "total_price": "75000.0000"
+      }
+    ]
+  },
+  {
+    "issuer_tax_id": "33.000.167/0001-01",
+    "document_number": "INV-2026-004",
+    "issue_date": "2026-11-08",
+    "currency_code": "BRL",
+    "subtotal_amount": "250000.0000",
+    "tax_amount": "0.0000",
+    "freight_amount": "0.0000",
+    "insurance_amount": "0.0000",
+    "total_amount": "250000.0000",
+    "incoterm": "FOB",
+    "extraction_confidence": "0.9990",
+    "lines": [
+      {
+        "line_number": 1,
+        "ncm_code": "09011110",
+        "description": "Café verde em grão arábica para exportação",
+        "quantity": "500.0000",
+        "unit_price": "500.0000",
+        "total_price": "250000.0000"
+      }
+    ]
+  },
+  {
+    "issuer_tax_id": "  11.222.333/0001-81  ",
+    "document_number": "INV-2026-005-HEALED",
+    "issue_date": "2026-11-09",
+    "currency_code": "USD",
+    "subtotal_amount": "10000.0",
+    "tax_amount": "0.0",
+    "freight_amount": "500.0",
+    "insurance_amount": "100.0",
+    "total_amount": "10600.0",
+    "incoterm": "CIF",
+    "extraction_confidence": "0.8500",
+    "lines": [
+      {
+        "line_number": 1,
+        "ncm_code": "84713012",
+        "description": "Servidores rack 1U montados",
+        "quantity": "5",
+        "unit_price": "2000.0",
+        "total_price": "10000.0"
+      }
+    ]
+  },
+  {
+    "issuer_tax_id": "33.000.167/0001-01",
+    "document_number": "INV-2026-ERR-MATH",
+    "issue_date": "2026-11-09",
+    "currency_code": "USD",
+    "subtotal_amount": "10000.0000",
+    "tax_amount": "0.0000",
+    "freight_amount": "500.0000",
+    "insurance_amount": "100.0000",
+    "total_amount": "9999.0000",
+    "incoterm": "CIF",
+    "extraction_confidence": "0.9500",
+    "lines": [
+      {
+        "line_number": 1,
+        "ncm_code": "84713012",
+        "description": "Lote com erro proposital de soma vertical para Quarentena HITL",
+        "quantity": "10.0000",
+        "unit_price": "1000.0000",
+        "total_price": "10000.0000"
+      }
+    ]
+  },
+  {
+    "issuer_tax_id": "CHE-116.281.710 MWST",
+    "document_number": "INV-2026-ERR-CIF",
+    "issue_date": "2026-11-09",
+    "currency_code": "CHF",
+    "subtotal_amount": "30000.0000",
+    "tax_amount": "0.0000",
+    "freight_amount": "0.0000",
+    "insurance_amount": "0.0000",
+    "total_amount": "30000.0000",
+    "incoterm": "CIF",
+    "extraction_confidence": "0.9000",
+    "lines": [
+      {
+        "line_number": 1,
+        "ncm_code": "30049099",
+        "description": "Incoterm CIF sem destaque de frete/seguro para Quarentena HITL",
+        "quantity": "15.0000",
+        "unit_price": "2000.0000",
+        "total_price": "30000.0000"
+      }
+    ]
+  }
+]
