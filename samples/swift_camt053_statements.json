@@ -1,0 +1,32 @@
+[
+  {
+    "end_to_end_id": "SWIFT-20261109-USD-001",
+    "invoice_number": "INV-2026-001",
+    "competence_date": "2026-11-06",
+    "settlement_date": "2026-11-09",
+    "currency_code": "USD",
+    "nominal_amount": "50000.0000",
+    "ptax_rate_competence": "5.824000",
+    "spot_rate_settlement": "5.846500",
+    "swift_fee_deducted": "25.0000",
+    "fee_clause": "SHA",
+    "ordering_customer": "Petróleo Brasileiro S.A.",
+    "account_credited": "1.1.1.01",
+    "account_receivable": "1.1.2.01"
+  },
+  {
+    "end_to_end_id": "SWIFT-20261109-CHF-002",
+    "invoice_number": "INV-2026-002",
+    "competence_date": "2026-11-06",
+    "settlement_date": "2026-11-09",
+    "currency_code": "CHF",
+    "nominal_amount": "125000.0000",
+    "ptax_rate_competence": "6.656000",
+    "spot_rate_settlement": "6.691000",
+    "swift_fee_deducted": "40.0000",
+    "fee_clause": "BEN",
+    "ordering_customer": "Novartis Pharma AG (CHE)",
+    "account_credited": "1.1.1.01",
+    "account_receivable": "1.1.2.01"
+  }
+]

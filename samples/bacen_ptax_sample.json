@@ -1,0 +1,146 @@
+[
+  {
+    "date_id": 20261105,
+    "currency_code": "USD",
+    "ptax_buy_rate": "5.811000",
+    "ptax_sell_rate": "5.811600",
+    "is_business_day": true,
+    "is_interpolated_locf": false
+  },
+  {
+    "date_id": 20261105,
+    "currency_code": "EUR",
+    "ptax_buy_rate": "6.270000",
+    "ptax_sell_rate": "6.271500",
+    "is_business_day": true,
+    "is_interpolated_locf": false
+  },
+  {
+    "date_id": 20261105,
+    "currency_code": "CHF",
+    "ptax_buy_rate": "6.640000",
+    "ptax_sell_rate": "6.642000",
+    "is_business_day": true,
+    "is_interpolated_locf": false
+  },
+  {
+    "date_id": 20261106,
+    "currency_code": "USD",
+    "ptax_buy_rate": "5.823400",
+    "ptax_sell_rate": "5.824000",
+    "is_business_day": true,
+    "is_interpolated_locf": false
+  },
+  {
+    "date_id": 20261106,
+    "currency_code": "EUR",
+    "ptax_buy_rate": "6.281000",
+    "ptax_sell_rate": "6.282500",
+    "is_business_day": true,
+    "is_interpolated_locf": false
+  },
+  {
+    "date_id": 20261106,
+    "currency_code": "CHF",
+    "ptax_buy_rate": "6.654000",
+    "ptax_sell_rate": "6.656000",
+    "is_business_day": true,
+    "is_interpolated_locf": false
+  },
+  {
+    "date_id": 20261107,
+    "currency_code": "USD",
+    "ptax_buy_rate": "5.823400",
+    "ptax_sell_rate": "5.824000",
+    "is_business_day": false,
+    "is_interpolated_locf": true
+  },
+  {
+    "date_id": 20261107,
+    "currency_code": "EUR",
+    "ptax_buy_rate": "6.281000",
+    "ptax_sell_rate": "6.282500",
+    "is_business_day": false,
+    "is_interpolated_locf": true
+  },
+  {
+    "date_id": 20261107,
+    "currency_code": "CHF",
+    "ptax_buy_rate": "6.654000",
+    "ptax_sell_rate": "6.656000",
+    "is_business_day": false,
+    "is_interpolated_locf": true
+  },
+  {
+    "date_id": 20261108,
+    "currency_code": "USD",
+    "ptax_buy_rate": "5.823400",
+    "ptax_sell_rate": "5.824000",
+    "is_business_day": false,
+    "is_interpolated_locf": true
+  },
+  {
+    "date_id": 20261108,
+    "currency_code": "EUR",
+    "ptax_buy_rate": "6.281000",
+    "ptax_sell_rate": "6.282500",
+    "is_business_day": false,
+    "is_interpolated_locf": true
+  },
+  {
+    "date_id": 20261108,
+    "currency_code": "CHF",
+    "ptax_buy_rate": "6.654000",
+    "ptax_sell_rate": "6.656000",
+    "is_business_day": false,
+    "is_interpolated_locf": true
+  },
+  {
+    "date_id": 20261109,
+    "currency_code": "USD",
+    "ptax_buy_rate": "5.845000",
+    "ptax_sell_rate": "5.846500",
+    "is_business_day": true,
+    "is_interpolated_locf": false
+  },
+  {
+    "date_id": 20261109,
+    "currency_code": "EUR",
+    "ptax_buy_rate": "6.312000",
+    "ptax_sell_rate": "6.314000",
+    "is_business_day": true,
+    "is_interpolated_locf": false
+  },
+  {
+    "date_id": 20261109,
+    "currency_code": "CHF",
+    "ptax_buy_rate": "6.689000",
+    "ptax_sell_rate": "6.691000",
+    "is_business_day": true,
+    "is_interpolated_locf": false
+  },
+  {
+    "date_id": 20261110,
+    "currency_code": "USD",
+    "ptax_buy_rate": "5.850000",
+    "ptax_sell_rate": "5.851500",
+    "is_business_day": true,
+    "is_interpolated_locf": false
+  },
+  {
+    "date_id": 20261110,
+    "currency_code": "EUR",
+    "ptax_buy_rate": "6.320000",
+    "ptax_sell_rate": "6.322000",
+    "is_business_day": true,
+    "is_interpolated_locf": false
+  },
+  {
+    "date_id": 20261110,
+    "currency_code": "CHF",
+    "ptax_buy_rate": "6.700000",
+    "ptax_sell_rate": "6.702000",
+    "is_business_day": true,
+    "is_interpolated_locf": false
+  }
+]
