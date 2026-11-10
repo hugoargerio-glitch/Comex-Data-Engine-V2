@@ -1,4 +1,4 @@
-name: Medallion OLAP & ODCS v3.2.0 Contract CI
+name: Comex Fiduciary Engine HTAP & ODCS v3.2.0 CI
 
 on:
   push:
@@ -7,41 +7,41 @@ on:
     branches: [main]
 
 jobs:
-  verify-lakehouse-and-contracts:
-    name: Bruin (Bronze) + dbt (Silver/Gold) + ODCS v3.2.0 Gate
+  verify-comex-engine:
+    name: HTAP Multi-Model + ODCS v3.2.0 + PyTest Suite
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install uv (Python 3.12 Package Manager)
+      - name: Install uv (Python Package Manager)
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
 
-      - name: Install Bruin CLI
+      - name: Set up Environment Variables
+        run: cp .env.example .env
+
+      - name: Start PostgreSQL 16 & MongoDB 7 (Docker Compose)
         run: |
-          curl -LsSf https://getbruin.com/install/cli | sh
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          docker compose up -d
+          # Aguarda os containers ficarem saudáveis
+          timeout 30s bash -c 'until docker compose ps | grep -q "(healthy)"; do sleep 2; done'
+          docker compose ps
 
       - name: Sync Virtual Environment (.venv)
-        run: uv sync --frozen
+        run: uv sync
 
-      - name: Gate 1 — Validate & Execute Bronze Ingestion (Bruin)
+      - name: Gate 1 — Lint Executable Data Contracts (ODCS v3.2.0)
         run: |
-          bruin validate ./pipelines/
-          bruin run ./pipelines/
+          uv run datacontract lint ./contracts/canonical_document_v1.odcs.yaml
+          uv run datacontract lint ./contracts/comex_fiduciary_engine_v2.odcs.yaml
 
-      - name: Gate 2 — Build & Test Silver/Gold Models (dbt Core + DuckDB)
+      - name: Gate 2 — Seed Multi-Model Databases (Postgres, Mongo, DuckDB)
         run: |
-          uv run dbt build --project-dir ./dbt_project --profiles-dir ./dbt_project
+          uv run python -m src.seed
 
-      - name: Gate 3 — Verify Selective State Compilation (state:modified+)
+      - name: Gate 3 — Run PyTest Suite (Unit, Mathematical & Integration Tests)
         run: |
-          uv run dbt compile --project-dir ./dbt_project --profiles-dir ./dbt_project --select state:modified+ --state ./target/prod_manifest
-
-      - name: Gate 4 — Lint & Execute ODCS v3.2.0 Data Contract (62 Checks)
-        run: |
-          uv run datacontract lint ./contracts/orders_silver_v1.odcs.yaml
-          uv run datacontract test ./contracts/orders_silver_v1.odcs.yaml --server local_duckdb
+          uv run pytest tests/ -v
