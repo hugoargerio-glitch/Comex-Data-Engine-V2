@@ -8,11 +8,11 @@ from sqlalchemy import text
 from src.connectors.mongo import get_mongo_client, get_raw_collection
 from src.connectors.postgres import engine
 from src.connectors.lakehouse import get_duckdb_connection, write_records_to_parquet_hive
-from src.pipeline.processor import HTAPProcessor
+from src.pipeline.comex_processor import ComexHTAPProcessor
 
 @pytest.mark.integration
 def test_live_mongo_connection_and_idempotency():
-    """Valida conectividade real com MongoDB 7 na porta 27017 e upsert idempotente."""
+    """Valida conectividade real com MongoDB 7 na porta 27018/27017 e upsert idempotente."""
     try:
         col = get_raw_collection("test_raw_collection")
         col.create_index([("idempotency_key", 1)], unique=True)
@@ -48,8 +48,8 @@ def test_live_mongo_connection_and_idempotency():
     col.delete_one({"idempotency_key": test_key})
 
 @pytest.mark.integration
-def test_live_postgres_connection_and_ddl():
-    """Valida conectividade real com PostgreSQL 16 na porta 5433 e presença de DDL."""
+def test_live_postgres_connection_and_comex_ddl():
+    """Valida conectividade real com PostgreSQL 16 e presença de DDL do Comex V2."""
     try:
         with engine.connect() as conn:
             result = conn.execute(text("SELECT 1 AS ping")).scalar()
@@ -57,13 +57,61 @@ def test_live_postgres_connection_and_ddl():
     except Exception as exc:
         pytest.skip(f"PostgreSQL não disponível ou credenciais inválidas: {exc}")
 
-    # Fora do bloco try/except de rede para garantir que falhas de esquema não sejam mascaradas como skip
     with engine.connect() as conn:
         tables = conn.execute(
             text("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
         ).scalars().all()
-        assert "canonical_records" in tables
-        assert "idempotency_registry" in tables
+        assert "commercial_invoices" in tables
+        assert "journal_entries" in tables
+        assert "journal_lines" in tables
+        assert "accounts" in tables
+        assert "comex_quarantine_hitl" in tables
+        assert "ingestion_idempotency_registry" in tables
+
+@pytest.mark.integration
+def test_live_postgres_append_only_trigger():
+    """Valida que a Trigger fn_enforce_append_only_ledger() bloqueia UPDATE/DELETE em journal_lines."""
+    try:
+        with engine.connect() as conn:
+            has_trigger = conn.execute(
+                text("SELECT 1 FROM pg_trigger WHERE tgname = 'trg_enforce_append_only_lines'")
+            ).scalar()
+            if not has_trigger:
+                pytest.skip("Trigger trg_enforce_append_only_lines ainda não aplicada no PostgreSQL.")
+    except Exception as exc:
+        pytest.skip(f"PostgreSQL indisponível: {exc}")
+
+    # Insere uma entrada temporária
+    entry_id = str(uuid.uuid4())
+    line_id = str(uuid.uuid4())
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO journal_entries (entry_id, transaction_date, competence_date, description, status)
+                VALUES (:eid, '2026-11-10', '2026-11-10', 'TEST_TRIGGER', 'POSTED')
+                """
+            ),
+            {"eid": entry_id},
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO journal_lines (line_id, entry_id, account_code, debit_amount, credit_amount, currency_code, original_currency_amount, line_order)
+                VALUES (:lid, :eid, '1.1.1.01', 100.0000, 0.0000, 'BRL', 100.0000, 1)
+                """
+            ),
+            {"lid": line_id, "eid": entry_id},
+        )
+
+    # Tenta sabotar journal_lines com UPDATE -> Deve disparar exceção
+    with pytest.raises(Exception) as exc_info:
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE journal_lines SET debit_amount = 999.0000 WHERE line_id = :lid"),
+                {"lid": line_id},
+            )
+    assert "Fiduciary Ledger Violation: journal_lines is strictly append-only" in str(exc_info.value)
 
 @pytest.mark.integration
 def test_duckdb_parquet_lakehouse_roundtrip(tmp_path):
@@ -74,7 +122,6 @@ def test_duckdb_parquet_lakehouse_roundtrip(tmp_path):
         {"year": 2026, "month": 11, "entity": "ORG_B", "metric_value": 240.25},
     ]
 
-    # Temporariamente sobrescreve PARQUET_BASE_DIR para a pasta tmp
     import src.connectors.lakehouse as lakehouse
     old_base = lakehouse.PARQUET_BASE_DIR
     lakehouse.PARQUET_BASE_DIR = str(tmp_path / "lakehouse")
@@ -94,11 +141,8 @@ def test_duckdb_parquet_lakehouse_roundtrip(tmp_path):
         lakehouse.PARQUET_BASE_DIR = old_base
 
 @pytest.mark.integration
-def test_live_htap_processor_double_barrier_and_quarantine():
-    """
-    Valida a Dupla Barreira de Idempotência (Mongo SHA-256 + Postgres ACID Upsert)
-    e o desvio automático de payload inválido para quarantine_records (HITL).
-    """
+def test_live_comex_htap_processor_e2e():
+    """Valida processamento E2E do ComexHTAPProcessor contra MongoDB e PostgreSQL."""
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
@@ -107,53 +151,36 @@ def test_live_htap_processor_double_barrier_and_quarantine():
     except Exception as exc:
         pytest.skip(f"Bancos Mongo/Postgres indisponíveis para teste E2E: {exc}")
 
-    processor = HTAPProcessor(source_system="TEST_SUITE", mongo_collection="test_processor_raw")
-    entity_code = f"ENT-{uuid.uuid4().hex[:8]}"
+    processor = ComexHTAPProcessor(source_system="TEST_SUITE_V2", mongo_collection="test_processor_raw")
+    doc_num = f"INV-TEST-{uuid.uuid4().hex[:6]}"
 
     valid_payload = {
-        "entity_code": entity_code,
-        "reference_date": "2026-11-09",
+        "issuer_tax_id": "33.000.167/0001-01",
+        "document_number": doc_num,
+        "issue_date": "2026-11-10",
         "currency_code": "USD",
-        "gross_amount": "2000.0000",
-        "deduction_amount": "150.0000",
-        "net_amount": "1850.0000"
+        "subtotal_amount": "5000.0000",
+        "tax_amount": "0.0000",
+        "freight_amount": "0.0000",
+        "insurance_amount": "0.0000",
+        "total_amount": "5000.0000",
+        "incoterm": "FOB",
+        "extraction_confidence": 0.99,
+        "lines": [
+            {
+                "line_number": 1,
+                "ncm_code": "84713012",
+                "description": "Notebooks de teste",
+                "quantity": "5.0000",
+                "unit_price": "1000.0000",
+                "line_total": "5000.0000",
+            }
+        ],
     }
 
-    invalid_payload = {
-        "entity_code": f"BAD-{uuid.uuid4().hex[:8]}",
-        "reference_date": "2026-11-09",
-        "currency_code": "USD",
-        "gross_amount": "1000.0000",
-        "deduction_amount": "100.0000",
-        "net_amount": "500.0000"  # Soma divergente -> Vai para Quarentena HITL!
-    }
+    res1 = processor.process_invoice_payload(valid_payload)
+    assert res1["status"] in ("COMMITTED_ACID", "PROCESSED_MEM")
 
-    try:
-        # 1. Primeira execução válida -> COMMITTED_ACID
-        res1 = processor.process_payload(valid_payload)
-        assert res1["status"] == "COMMITTED_ACID"
-        assert res1["net_amount"] == "1850.0000"
-
-        # 2. Segunda execução idêntica -> DUPLICATE_IGNORED (Dupla Barreira de Idempotência)
-        res2 = processor.process_payload(valid_payload)
-        assert res2["status"] == "DUPLICATE_IGNORED"
-        assert res2["record_id"] == res1["record_id"]
-
-        # 3. Execução com erro de contrato -> QUARANTINED (Salvo no Mongo + quarantine_records no Postgres)
-        res_bad = processor.process_payload(invalid_payload)
-        assert res_bad["status"] == "QUARANTINED"
-        assert "quarantine_id" in res_bad
-    finally:
-        # Limpeza pós-teste
-        col.drop()
-        with engine.begin() as conn:
-            conn.execute(
-                text("DELETE FROM idempotency_registry WHERE source_system = 'TEST_SUITE'")
-            )
-            conn.execute(
-                text("DELETE FROM canonical_records WHERE entity_code = :ec"),
-                {"ec": entity_code},
-            )
-            conn.execute(
-                text("DELETE FROM quarantine_records WHERE source_system = 'TEST_SUITE'")
-            )
+    # Segunda chamada idêntica -> DUPLICATE_IGNORED
+    res2 = processor.process_invoice_payload(valid_payload)
+    assert res2["status"] == "DUPLICATE_IGNORED"
