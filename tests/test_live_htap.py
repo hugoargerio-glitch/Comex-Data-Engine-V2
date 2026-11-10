@@ -165,7 +165,7 @@ def test_live_comex_htap_processor_e2e():
         "insurance_amount": "0.0000",
         "total_amount": "5000.0000",
         "incoterm": "FOB",
-        "extraction_confidence": 0.99,
+        "extraction_confidence": "0.9900",
         "lines": [
             {
                 "line_number": 1,
@@ -173,7 +173,7 @@ def test_live_comex_htap_processor_e2e():
                 "description": "Notebooks de teste",
                 "quantity": "5.0000",
                 "unit_price": "1000.0000",
-                "line_total": "5000.0000",
+                "total_price": "5000.0000",
             }
         ],
     }

@@ -84,6 +84,14 @@ class CommercialInvoiceLineInput(BaseModel):
     unit_price: Decimal = Field(..., ge=Decimal("0.0000"), description="Unit price in invoice currency")
     total_price: Decimal = Field(..., ge=Decimal("0.0000"), description="Line total price")
 
+    @model_validator(mode="before")
+    @classmethod
+    def map_legacy_line_total(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "total_price" not in data and "line_total" in data:
+                data["total_price"] = data.get("line_total")
+        return data
+
     @field_validator("quantity", "unit_price", "total_price", mode="before")
     @classmethod
     def reject_float_and_quantize(cls, v: Any) -> Decimal:

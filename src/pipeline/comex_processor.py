@@ -188,12 +188,15 @@ class ComexHTAPProcessor:
                             current_payload[field_name] = cleaned
                             modified = True
 
-                # Case 3: Line items float correction
+                # Case 3: Line items float correction & legacy alias
                 if field_name == "lines" and len(loc) >= 3:
                     idx = loc[1]
                     subfield = loc[2]
                     if isinstance(idx, int) and idx < len(current_payload.get("lines", [])):
                         line = current_payload["lines"][idx]
+                        if subfield == "total_price" and "line_total" in line and "total_price" not in line:
+                            line["total_price"] = line.pop("line_total")
+                            modified = True
                         if subfield in {"quantity", "unit_price", "total_price"}:
                             lval = line.get(subfield)
                             if isinstance(lval, (float, int)):
