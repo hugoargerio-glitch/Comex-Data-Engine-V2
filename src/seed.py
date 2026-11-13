@@ -10,44 +10,48 @@ import os
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
+from alembic import command
+from alembic.config import Config
 from dotenv import load_dotenv
 from sqlalchemy import text
 
 load_dotenv()
 
-from src.connectors.postgres import engine
+from src.connectors.lakehouse import duckdb_connection, get_parquet_base_dir
 from src.connectors.mongo import get_mongo_client
-from src.connectors.lakehouse import get_duckdb_connection
+from src.connectors.postgres import engine
+from src.extractors.http_client import compute_payload_hash
 from src.models.customs import (
     ComexOperationInput,
     CustomsNationalizationCalcInput,
     PTAXRateInput,
-    build_swift_fee_split_entry,
 )
 from src.pipeline.comex_processor import ComexHTAPProcessor
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 SAMPLES_DIR = BASE_DIR / "samples"
-SQL_DDL_DIR = BASE_DIR / "sql" / "ddl"
 
 
 def apply_database_ddl() -> None:
-    """Aplica os scripts DDL e popula dimensões de referência no PostgreSQL."""
-    print("🐘 [PostgreSQL] Aplicando DDLs e Triggers de Imutabilidade...")
+    """Executa Alembic migrations (`upgrade head`) e popula dimensões de referência idempotentes."""
+    print("🐘 [PostgreSQL] Executando Alembic upgrade head e dimensões conformadas...")
+    alembic_cfg = Config(str(BASE_DIR / "alembic.ini"))
+    alembic_cfg.set_main_option("script_location", str(BASE_DIR / "alembic"))
+    db_url = os.getenv("DATABASE_URL")
+    if db_url:
+        alembic_cfg.set_main_option("sqlalchemy.url", db_url)
+    command.upgrade(alembic_cfg, "head")
+
     with engine.begin() as conn:
-        for ddl_file in sorted(SQL_DDL_DIR.glob("*.sql")):
-            print(f"   -> Executando {ddl_file.name}")
-            with open(ddl_file, "r", encoding="utf-8") as f:
-                conn.execute(text(f.read()))
 
         # Popula dim_date para Novembro de 2026 (evita ForeignKeyViolation)
         conn.execute(
             text(
                 """
                 INSERT INTO dim_date (date_id, full_date, year, month, day, quarter, is_business_day)
-                SELECT 
+                SELECT
                     TO_CHAR(d, 'YYYYMMDD')::INT,
                     d::DATE,
                     EXTRACT(YEAR FROM d)::INT,
@@ -66,7 +70,7 @@ def apply_database_ddl() -> None:
             text(
                 """
                 INSERT INTO dim_merchandise_ncm (ncm_code, hs_code, description, unit_measure)
-                VALUES 
+                VALUES
                     ('84713012', '847130', 'Laptops corporativos e computadores portáteis', 'UNIDADE'),
                     ('30049099', '300490', 'Medicamentos e produtos farmacêuticos dosados', 'KG'),
                     ('09011110', '090111', 'Café verde em grão arábica para exportação', 'KG'),
@@ -81,7 +85,7 @@ def apply_database_ddl() -> None:
             text(
                 """
                 INSERT INTO dim_partner_country (country_code, country_iso3, country_name, economic_block)
-                VALUES 
+                VALUES
                     (249, 'USA', 'Estados Unidos da América', 'USMCA'),
                     (767, 'CHE', 'Suíça', 'EFTA'),
                     (160, 'CHN', 'China', 'BRICS'),
@@ -105,7 +109,7 @@ def seed_commercial_invoices(processor: ComexHTAPProcessor) -> Dict[str, int]:
     with open(invoices_file, "r", encoding="utf-8") as f:
         invoices_data: List[Dict[str, Any]] = json.load(f)
 
-    counts = {"COMMITTED_ACID": 0, "QUARANTINED": 0, "PROCESSED_MEM": 0, "DUPLICATE_IGNORED": 0}
+    counts = {"COMMITTED_ACID": 0, "QUARANTINED": 0, "DUPLICATE_IGNORED": 0}
 
     for inv in invoices_data:
         res = processor.process_invoice(inv)
@@ -119,31 +123,66 @@ def seed_commercial_invoices(processor: ComexHTAPProcessor) -> Dict[str, int]:
 
 def seed_hitl_quarantine_resolution(processor: ComexHTAPProcessor) -> Dict[str, Any]:
     """
-    Simula a intervenção humana (HITL) na fila de quarentena:
-    Localiza INV-2026-ERR-CIF, aplica a retificação auditada (adicionando frete e seguro)
-    e promove para o Core Operacional com escrituração contábil em partidas dobradas.
+    Simula a intervenção humana (HITL) na fila de quarentena de forma 100% idempotente:
+    Localiza INV-2026-ERR-CIF pelo raw_payload_hash determinístico, verifica se já foi
+    aprovada em execuções anteriores e, se ainda PENDING_REVIEW, aplica a retificação
+    auditada e promove para o Core Operacional + Ledger.
     Mantém INV-2026-ERR-MATH em PENDING_REVIEW para auditoria externa.
     """
     print("\n🔍 [HITL Quarantine Resolution] Processando fila de resolução humana...")
-    pending_items = processor.get_pending_quarantine_items(status_filter="PENDING_REVIEW")
+    invoices_file = SAMPLES_DIR / "commercial_invoices_batch.json"
+    if not invoices_file.exists():
+        raise FileNotFoundError(f"Seed sample file missing: {invoices_file}")
 
-    cif_quarantine_id = None
-    for item in pending_items:
-        errors_str = str(item.get("validation_errors", ""))
-        if "CIF Incoterm requires explicit freight_amount" in errors_str:
-            cif_quarantine_id = item["quarantine_id"]
-            break
+    with open(invoices_file, "r", encoding="utf-8") as f:
+        invoices_data: List[Dict[str, Any]] = json.load(f)
 
-    if not cif_quarantine_id and pending_items:
-        for item in pending_items:
-            errors_str = str(item.get("validation_errors", ""))
-            if "vertical closure" not in errors_str:
-                cif_quarantine_id = item["quarantine_id"]
-                break
+    cif_raw_payload = next(
+        (item for item in invoices_data if item.get("document_number") == "INV-2026-ERR-CIF"),
+        None,
+    )
+    if cif_raw_payload is None:
+        raise RuntimeError("INV-2026-ERR-CIF not found in commercial_invoices_batch.json")
 
-    if not cif_quarantine_id:
-        print("   ⚠️ Registro de quarentena para INV-2026-ERR-CIF não localizado.")
-        return {}
+    cif_payload_hash = compute_payload_hash(cif_raw_payload)
+    with engine.connect() as conn:
+        q_row = conn.execute(
+            text(
+                """
+                SELECT quarantine_id, review_status, reviewed_by
+                FROM comex_quarantine_hitl
+                WHERE raw_payload_hash = :hash
+                ORDER BY created_at ASC
+                LIMIT 1
+                """
+            ),
+            {"hash": cif_payload_hash},
+        ).mappings().one_or_none()
+
+    if q_row is None:
+        raise RuntimeError(
+            "Quarantine record for INV-2026-ERR-CIF was not found after invoice ingestion."
+        )
+
+    cif_quarantine_id = str(q_row["quarantine_id"])
+    current_status = str(q_row["review_status"])
+
+    if current_status == "APPROVED_OVERRIDE":
+        print(
+            f"   ⏭️ Quarentena {cif_quarantine_id} (INV-2026-ERR-CIF) já resolvida "
+            f"como APPROVED_OVERRIDE; replay idempotente sem mutações."
+        )
+        return {
+            "quarantine_id": cif_quarantine_id,
+            "review_status": "APPROVED_OVERRIDE",
+            "reviewed_by": q_row.get("reviewed_by"),
+            "idempotent_replay": True,
+        }
+
+    if current_status != "PENDING_REVIEW":
+        raise RuntimeError(
+            f"Unexpected quarantine state for INV-2026-ERR-CIF ({cif_quarantine_id}): {current_status}"
+        )
 
     corrected_payload = {
         "issuer_tax_id": "CHE-116.281.710 MWST",
@@ -177,7 +216,7 @@ def seed_hitl_quarantine_resolution(processor: ComexHTAPProcessor) -> Dict[str, 
     )
     print(f"   ✅ Quarentena {cif_quarantine_id} promovida com sucesso! Status: {result.get('review_status')} (Auditado por: {result.get('reviewed_by')})")
     print(f"      • Documento: {result.get('document_number')} | Invoice ID: {result.get('invoice_id')} | Journal Entry ID: {result.get('journal_entry_id')}")
-    print(f"      • INV-2026-ERR-MATH mantida em PENDING_REVIEW para auditoria fiscal.")
+    print("      • INV-2026-ERR-MATH mantida em PENDING_REVIEW para auditoria fiscal.")
     return result
 
 
@@ -197,8 +236,11 @@ def seed_ptax_rates(processor: ComexHTAPProcessor) -> int:
     return persisted
 
 
-def seed_swift_settlements() -> int:
-    """Gera lançamentos contábeis de liquidação bancária com split de tarifa SWIFT."""
+def seed_swift_settlements(processor: Optional[ComexHTAPProcessor] = None) -> int:
+    """
+    Gera lançamentos contábeis de liquidação bancária com split de tarifa SWIFT
+    usando uuid5 determinístico + idempotência completa (Mongo + PostgreSQL Ledger).
+    """
     swift_file = SAMPLES_DIR / "swift_camt053_statements.json"
     if not swift_file.exists():
         return 0
@@ -207,69 +249,29 @@ def seed_swift_settlements() -> int:
     with open(swift_file, "r", encoding="utf-8") as f:
         statements = json.load(f)
 
+    proc = processor or ComexHTAPProcessor(source_system="SEED_SWIFT_RUNNER")
     inserted = 0
-    with engine.begin() as conn:
-        for stmt in statements:
-            t_date = datetime.strptime(stmt["settlement_date"], "%Y-%m-%d").date()
-            c_date = datetime.strptime(stmt["competence_date"], "%Y-%m-%d").date()
-            entry = build_swift_fee_split_entry(
-                reference_document_id=stmt["invoice_number"],
-                transaction_date=t_date,
-                competence_date=c_date,
-                gross_amount=Decimal(stmt["nominal_amount"]),
-                fee_amount=Decimal(stmt["swift_fee_deducted"]),
-                currency_code=stmt["currency_code"],
-                exchange_rate=Decimal(stmt["spot_rate_settlement"]),
-                cash_account=stmt.get("account_credited", "1.1.1.01"),
-                fee_account="4.1.2.01",
-                ar_account=stmt.get("account_receivable", "1.1.2.01"),
-            )
-
-            # Insere cabeçalho
-            conn.execute(
-                text(
-                    """
-                    INSERT INTO journal_entries (entry_id, transaction_date, competence_date, reference_document_id, description, status)
-                    VALUES (:id, :t_date, :c_date, :ref, :desc, 'POSTED')
-                    ON CONFLICT (entry_id) DO NOTHING
-                    """
-                ),
-                {
-                    "id": entry.entry_id,
-                    "t_date": entry.transaction_date,
-                    "c_date": entry.competence_date,
-                    "ref": entry.reference_document_id,
-                    "desc": entry.description,
-                },
-            )
-
-            # Insere linhas
-            for line in entry.lines:
-                conn.execute(
-                    text(
-                        """
-                        INSERT INTO journal_lines (
-                            line_id, entry_id, account_code, debit_amount, credit_amount,
-                            currency_code, original_currency_amount, exchange_rate_applied, line_order
-                        )
-                        VALUES (:lid, :eid, :acct, :debit, :credit, :curr, :orig, :rate, :ord)
-                        ON CONFLICT (line_id) DO NOTHING
-                        """
-                    ),
-                    {
-                        "lid": line.line_id,
-                        "eid": entry.entry_id,
-                        "acct": line.account_code,
-                        "debit": line.debit_amount,
-                        "credit": line.credit_amount,
-                        "curr": line.currency_code,
-                        "orig": line.original_currency_amount,
-                        "rate": line.exchange_rate_applied,
-                        "ord": line.line_order,
-                    },
-                )
+    for stmt in statements:
+        t_date = datetime.strptime(stmt["settlement_date"], "%Y-%m-%d").date()
+        c_date = datetime.strptime(stmt["competence_date"], "%Y-%m-%d").date()
+        res = proc.reconcile_swift_settlement(
+            reference_document_id=stmt["invoice_number"],
+            transaction_date=t_date,
+            competence_date=c_date,
+            gross_amount=Decimal(str(stmt["nominal_amount"])),
+            fee_amount=Decimal(str(stmt["swift_fee_deducted"])),
+            currency_code=stmt["currency_code"],
+            exchange_rate=Decimal(str(stmt["spot_rate_settlement"])),
+            cash_account=stmt.get("account_credited", "1.1.1.01"),
+            fee_account="4.1.2.01",
+            ar_account=stmt.get("account_receivable", "1.1.2.01"),
+            raw_payload=stmt,
+        )
+        if res.get("status") == "RECONCILED":
             inserted += 1
             print(f"   • SWIFT {stmt['end_to_end_id']} escriturado (Soma Zero garantida)")
+        else:
+            print(f"   ⏭️ SWIFT {stmt['end_to_end_id']} já escriturado (replay idempotente)")
 
     return inserted
 
@@ -357,21 +359,23 @@ def print_summary() -> None:
             text("SELECT COALESCE(SUM(debit_amount) - SUM(credit_amount), 0) FROM journal_lines")
         ).scalar() or Decimal("0.0000")
 
-    # Contagem no MongoDB (se disponível)
-    mongo_raw_count = "N/A"
-    try:
-        mclient = get_mongo_client()
-        mongo_raw_count = mclient[os.getenv("MONGO_DB", "comex_raw_lake")]["raw_commercial_invoices"].count_documents({})
-    except Exception:
-        pass
+    # Contagem no MongoDB (falha explicitamente se indisponível)
+    mclient = get_mongo_client()
+    mongo_raw_count = mclient[os.getenv("MONGO_DB", "comex_raw_lake")]["raw_commercial_invoices"].count_documents({})
 
-    # Contagem no DuckDB
-    duckdb_facts = "N/A"
-    try:
-        dcon = get_duckdb_connection()
-        duckdb_facts = dcon.execute("SELECT COUNT(*) FROM fact_comex_operations").fetchone()[0]
-    except Exception:
-        pass
+    # Contagem no DuckDB/Parquet (fecha conexão em finally e falha explicitamente em erro)
+    parquet_fact_dir = get_parquet_base_dir() / "fact_comex_operations"
+    parquet_glob = (parquet_fact_dir / "**" / "*.parquet").resolve().as_posix()
+    with duckdb_connection() as dcon:
+        if any(parquet_fact_dir.rglob("*.parquet")):
+            row = dcon.execute(
+                "SELECT COUNT(*) FROM read_parquet(?, hive_partitioning=true)",
+                [parquet_glob],
+            ).fetchone()
+            duckdb_facts = int(row[0]) if row is not None else 0
+        else:
+            dcon.execute("SELECT 1").fetchone()
+            duckdb_facts = 0
 
     print(f" 🐘 PostgreSQL commercial_invoices:     {invoices_count:>5} registros (Validados & Desembaraçados)")
     print(f" 🐘 PostgreSQL journal_entries:         {entries_count:>5} lançamentos contábeis")
@@ -391,22 +395,17 @@ def print_summary() -> None:
 
 def main() -> None:
     print("🚢 Iniciando Seed Físico do Comex Data Engine V2...")
-    try:
-        apply_database_ddl()
-    except Exception as exc:
-        print(f"⚠️ Aviso ao aplicar DDLs: {exc}")
+    apply_database_ddl()
 
     processor = ComexHTAPProcessor(source_system="SEED_RUNNER")
+    # Seed PTAX rates BEFORE invoices, HITL overrides, and customs calculations
+    seed_ptax_rates(processor)
     seed_commercial_invoices(processor)
     seed_hitl_quarantine_resolution(processor)
-    seed_ptax_rates(processor)
-    seed_swift_settlements()
+    seed_swift_settlements(processor)
     seed_comex_mdic_operations(processor)
     seed_customs_nationalizations(processor)
-    try:
-        print_summary()
-    except Exception as exc:
-        print(f"⚠️ Aviso ao gerar resumo: {exc}")
+    print_summary()
 
 
 if __name__ == "__main__":
