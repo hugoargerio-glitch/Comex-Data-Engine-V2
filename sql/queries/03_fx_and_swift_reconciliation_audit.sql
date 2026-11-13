@@ -27,14 +27,14 @@ JOIN accounts a ON jl.account_code = a.account_code
 WHERE jl.account_code IN ('3.1.2.01', '4.1.3.01', '4.1.2.01')
 ORDER BY je.transaction_date DESC, jl.account_code;
 
--- 2. Resumo Consolidado do Resultado Financeiro Cambial & Tarifário
+-- 2. Resumo Consolidado do Resultado Financeiro Cambial & Tarifário (líquido de eventuais estornos)
 SELECT 
-    COALESCE(SUM(CASE WHEN jl.account_code = '3.1.2.01' THEN jl.credit_amount ELSE 0 END), 0.0000) AS total_ganho_cambial_brl,
-    COALESCE(SUM(CASE WHEN jl.account_code = '4.1.3.01' THEN jl.debit_amount ELSE 0 END), 0.0000) AS total_perda_cambial_brl,
-    COALESCE(SUM(CASE WHEN jl.account_code = '4.1.2.01' THEN jl.debit_amount ELSE 0 END), 0.0000) AS total_tarifas_swift_brl,
+    COALESCE(SUM(CASE WHEN jl.account_code = '3.1.2.01' THEN (jl.credit_amount - jl.debit_amount) ELSE 0.0000 END), 0.0000) AS total_ganho_cambial_brl,
+    COALESCE(SUM(CASE WHEN jl.account_code = '4.1.3.01' THEN (jl.debit_amount - jl.credit_amount) ELSE 0.0000 END), 0.0000) AS total_perda_cambial_brl,
+    COALESCE(SUM(CASE WHEN jl.account_code = '4.1.2.01' THEN (jl.debit_amount - jl.credit_amount) ELSE 0.0000 END), 0.0000) AS total_tarifas_swift_brl,
     (
-        COALESCE(SUM(CASE WHEN jl.account_code = '3.1.2.01' THEN jl.credit_amount ELSE 0 END), 0.0000)
-        - COALESCE(SUM(CASE WHEN jl.account_code = '4.1.3.01' THEN jl.debit_amount ELSE 0 END), 0.0000)
-        - COALESCE(SUM(CASE WHEN jl.account_code = '4.1.2.01' THEN jl.debit_amount ELSE 0 END), 0.0000)
+        COALESCE(SUM(CASE WHEN jl.account_code = '3.1.2.01' THEN (jl.credit_amount - jl.debit_amount) ELSE 0.0000 END), 0.0000)
+        - COALESCE(SUM(CASE WHEN jl.account_code = '4.1.3.01' THEN (jl.debit_amount - jl.credit_amount) ELSE 0.0000 END), 0.0000)
+        - COALESCE(SUM(CASE WHEN jl.account_code = '4.1.2.01' THEN (jl.debit_amount - jl.credit_amount) ELSE 0.0000 END), 0.0000)
     ) AS resultado_liquido_operacoes_cambiais_brl
 FROM journal_lines jl;

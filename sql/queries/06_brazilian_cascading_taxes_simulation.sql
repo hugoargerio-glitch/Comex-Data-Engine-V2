@@ -35,12 +35,14 @@ ORDER BY cn.clearance_date DESC;
 SELECT 
     cn.declaration_number,
     cn.tax_regime,
+    ABS(cn.cif_amount - (cn.fob_amount + cn.freight_amount + cn.insurance_amount)) AS delta_cif_closure,
     ABS(cn.total_taxes_brl - (cn.ii_amount_brl + cn.ipi_amount_brl + cn.pis_amount_brl + cn.cofins_amount_brl + cn.siscomex_fee_brl + cn.afrmm_brl + cn.icms_amount_brl)) AS delta_fechamento_tributos,
     ABS(cn.landed_cost_brl - (cn.customs_value_brl + cn.total_taxes_brl)) AS delta_landed_cost,
     ABS(cn.landed_cost_brl - (cn.net_inventory_cost_brl + cn.recoverable_taxes_brl)) AS delta_cpc16_segregacao
 FROM customs_nationalizations cn
 WHERE 
-    ABS(cn.total_taxes_brl - (cn.ii_amount_brl + cn.ipi_amount_brl + cn.pis_amount_brl + cn.cofins_amount_brl + cn.siscomex_fee_brl + cn.afrmm_brl + cn.icms_amount_brl)) > 0.0001
+    ABS(cn.cif_amount - (cn.fob_amount + cn.freight_amount + cn.insurance_amount)) > 0.0001
+    OR ABS(cn.total_taxes_brl - (cn.ii_amount_brl + cn.ipi_amount_brl + cn.pis_amount_brl + cn.cofins_amount_brl + cn.siscomex_fee_brl + cn.afrmm_brl + cn.icms_amount_brl)) > 0.0001
     OR ABS(cn.landed_cost_brl - (cn.customs_value_brl + cn.total_taxes_brl)) > 0.0001
     OR ABS(cn.landed_cost_brl - (cn.net_inventory_cost_brl + cn.recoverable_taxes_brl)) > 0.0001;
 

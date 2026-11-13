@@ -1,15 +1,16 @@
 -- ==============================================================================
 -- 04: Star Schema Analítico — Landed Cost por NCM, País, Modal e PTAX (LOCF)
--- Ferramenta: DBeaver (PostgreSQL 16 / DuckDB)
--- Modelagem: fact_comex_operations + dim_merchandise_ncm + dim_currency_ptax
+-- Ferramenta: DBeaver (PostgreSQL 16 — Star Schema comex_fiduciary_db)
+-- Nota: DuckDB contém apenas views Parquet de fact_comex_operations e dim_currency_ptax; dimensões completas residem no PostgreSQL.
+-- Modelagem: fact_comex_operations + dim_merchandise_ncm + dim_partner_country + dim_date + dim_currency_ptax
 -- ==============================================================================
 
 -- 1. Análise de Custo Internalizado (Landed Cost) e Frete por NCM
 SELECT 
     f.operation_type,
     f.ncm_code,
-    COALESCE(dn.ncm_description, 'Nomenclatura Aduaneira Especial') AS descricao_ncm,
-    dp.country_name_pt AS pais_parceiro,
+    COALESCE(dn.description, 'Nomenclatura Aduaneira Especial') AS descricao_ncm,
+    dp.country_name AS pais_parceiro,
     f.uf_code AS estado_desembaraco,
     COUNT(f.operation_hash_id) AS total_declaracoes,
     SUM(f.net_weight_kg) AS peso_liquido_total_kg,
@@ -23,7 +24,7 @@ FROM fact_comex_operations f
 LEFT JOIN dim_merchandise_ncm dn ON f.ncm_code = dn.ncm_code
 LEFT JOIN dim_partner_country dp ON f.country_code = dp.country_code
 GROUP BY 
-    f.operation_type, f.ncm_code, dn.ncm_description, dp.country_name_pt, f.uf_code
+    f.operation_type, f.ncm_code, dn.description, dp.country_name, f.uf_code
 ORDER BY total_landed_cost_brl DESC;
 
 -- 2. Inspeção da Dimensão PTAX: Verificação do Preenchimento LOCF em Finais de Semana
@@ -31,7 +32,6 @@ ORDER BY total_landed_cost_brl DESC;
 SELECT 
     d.date_id,
     d.full_date,
-    d.day_of_week_name_pt,
     p.currency_code,
     p.ptax_buy_rate,
     p.ptax_sell_rate,
