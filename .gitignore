@@ -4,9 +4,11 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
-# Local Lakehouse Databases (DuckDB & SQLite)
-*.duckdb
-*.duckdb.wal
+# Local Lakehouse Databases & Parquet Data (DuckDB, Parquet & SQLite)
+*.duckdb*
+*.parquet
+data/parquet_lakehouse/
+data/raw_mdic/
 *.db
 *.db-wal
 *.db-shm

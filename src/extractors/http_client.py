@@ -1,7 +1,9 @@
 import hashlib
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 import httpx
 from tenacity import (
@@ -12,6 +14,8 @@ from tenacity import (
 )
 
 from src.connectors.mongo import get_raw_collection
+
+logger = logging.getLogger("comex.extractors.http_client")
 
 
 class RetryableHTTPError(Exception):
@@ -43,6 +47,19 @@ class ResilientAPIExtractor:
         self.timeout_seconds = timeout_seconds
         self._client = client
 
+    def _resolve_url(self, endpoint: str) -> str:
+        """Resolve full URLs (including @odata.nextLink) or relative endpoints safely."""
+        if endpoint.startswith(("http://", "https://")):
+            return endpoint
+        if not self.base_url:
+            return endpoint
+
+        parsed_base = urlparse(self.base_url)
+        base_path = parsed_base.path.rstrip("/")
+        if base_path and endpoint.startswith(base_path + "/"):
+            return f"{parsed_base.scheme}://{parsed_base.netloc}{endpoint}"
+        return f"{self.base_url}/{endpoint.lstrip('/')}"
+
     @retry(
         reraise=True,
         stop=stop_after_attempt(4),
@@ -55,13 +72,13 @@ class ResilientAPIExtractor:
         params: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
-        """Executa GET resiliente com retentativa automática em falhas de rede, 429 e 5xx."""
-        url = f"{self.base_url}/{endpoint.lstrip('/')}" if self.base_url else endpoint
+        """Executa GET resiliente com retentativa apenas em falhas de rede/timeout, 429 e 5xx."""
+        url = self._resolve_url(endpoint)
 
         if self._client is not None:
             response = self._client.get(url, params=params, headers=headers)
         else:
-            with httpx.Client(timeout=self.timeout_seconds) as client:
+            with httpx.Client(timeout=self.timeout_seconds, verify=True) as client:
                 response = client.get(url, params=params, headers=headers)
 
         if response.status_code == 429 or response.status_code >= 500:
@@ -69,6 +86,7 @@ class ResilientAPIExtractor:
                 f"Transient HTTP {response.status_code} from {url}"
             )
 
+        # 4xx (except 429) raises httpx.HTTPStatusError immediately without retry
         response.raise_for_status()
         data = response.json()
         if isinstance(data, dict):
