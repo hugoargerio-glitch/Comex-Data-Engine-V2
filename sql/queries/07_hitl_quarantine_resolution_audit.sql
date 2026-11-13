@@ -31,37 +31,67 @@ GROUP BY review_status
 ORDER BY review_status;
 
 -- 3. Reconciliação de Faturas Promovidas (APPROVED_OVERRIDE) no Core Operacional
--- Cruza a quarentena resolvida com a fatura persistida em commercial_invoices e registro de idempotência
-SELECT 
-    q.quarantine_id,
-    q.review_status,
-    q.reviewed_by,
-    q.reviewed_at,
-    ci.invoice_id,
-    ci.document_number,
-    ci.issuer_tax_id,
-    ci.issue_date,
-    ci.currency_code,
-    ci.subtotal_amount,
-    ci.tax_amount,
-    ci.freight_amount,
-    ci.insurance_amount,
-    ci.total_amount,
-    ci.incoterm,
-    iir.status AS edge_idempotency_status
-FROM comex_quarantine_hitl q
-JOIN commercial_invoices ci 
-    ON q.raw_payload_hash = ci.raw_payload_hash 
-    OR q.mongo_raw_id = ci.mongo_raw_id
-LEFT JOIN ingestion_idempotency_registry iir 
-    ON q.raw_payload_hash = iir.payload_hash
-WHERE q.review_status = 'APPROVED_OVERRIDE'
-ORDER BY q.reviewed_at DESC;
+-- Usa DISTINCT ON determinístico priorizando registry -> hash -> mongo_raw_id para eliminar fan-out cartesiano
+WITH resolved_quarantine_invoices AS (
+    SELECT DISTINCT ON (q.quarantine_id)
+        q.quarantine_id,
+        q.review_status,
+        q.reviewed_by,
+        q.reviewed_at,
+        ci.invoice_id,
+        ci.document_number,
+        ci.issuer_tax_id,
+        ci.issue_date,
+        ci.currency_code,
+        ci.subtotal_amount,
+        ci.tax_amount,
+        ci.freight_amount,
+        ci.insurance_amount,
+        ci.total_amount,
+        ci.incoterm,
+        iir.status AS edge_idempotency_status
+    FROM comex_quarantine_hitl q
+    LEFT JOIN ingestion_idempotency_registry iir
+        ON iir.payload_hash = q.raw_payload_hash
+    JOIN commercial_invoices ci
+        ON ci.invoice_id::TEXT = iir.target_entity_id
+        OR ci.raw_payload_hash = q.raw_payload_hash
+        OR (q.mongo_raw_id IS NOT NULL AND ci.mongo_raw_id = q.mongo_raw_id)
+    WHERE q.review_status = 'APPROVED_OVERRIDE'
+    ORDER BY
+        q.quarantine_id,
+        CASE
+            WHEN ci.invoice_id::TEXT = iir.target_entity_id THEN 1
+            WHEN ci.raw_payload_hash = q.raw_payload_hash THEN 2
+            ELSE 3
+        END,
+        ci.created_at DESC,
+        ci.invoice_id
+)
+SELECT
+    quarantine_id,
+    review_status,
+    reviewed_by,
+    reviewed_at,
+    invoice_id,
+    document_number,
+    issuer_tax_id,
+    issue_date,
+    currency_code,
+    subtotal_amount,
+    tax_amount,
+    freight_amount,
+    insurance_amount,
+    total_amount,
+    incoterm,
+    edge_idempotency_status
+FROM resolved_quarantine_invoices
+ORDER BY reviewed_at DESC;
 
 -- 4. Reconciliação Contábil Fiduciária (Partidas Dobradas) de Faturas Promovidas via HITL
--- Verifica o balanceamento de soma zero nos lançamentos das faturas sobrepostas
-WITH hitl_invoices AS (
-    SELECT 
+-- Elimina fan-out cartesiano combinando chaves determinísticas (1 fatura e 1 lançamento HITL por quarentena) e CTE pré-agregada de journal_lines
+WITH resolved_quarantine_invoices AS (
+    SELECT DISTINCT ON (q.quarantine_id)
         q.quarantine_id,
         q.reviewed_by,
         q.reviewed_at,
@@ -69,47 +99,95 @@ WITH hitl_invoices AS (
         ci.document_number,
         ci.total_amount AS invoice_total
     FROM comex_quarantine_hitl q
-    JOIN commercial_invoices ci 
-        ON q.raw_payload_hash = ci.raw_payload_hash 
-        OR q.mongo_raw_id = ci.mongo_raw_id
+    LEFT JOIN ingestion_idempotency_registry iir
+        ON iir.payload_hash = q.raw_payload_hash
+    JOIN commercial_invoices ci
+        ON ci.invoice_id::TEXT = iir.target_entity_id
+        OR ci.raw_payload_hash = q.raw_payload_hash
+        OR (q.mongo_raw_id IS NOT NULL AND ci.mongo_raw_id = q.mongo_raw_id)
     WHERE q.review_status = 'APPROVED_OVERRIDE'
+    ORDER BY
+        q.quarantine_id,
+        CASE
+            WHEN ci.invoice_id::TEXT = iir.target_entity_id THEN 1
+            WHEN ci.raw_payload_hash = q.raw_payload_hash THEN 2
+            ELSE 3
+        END,
+        ci.created_at DESC,
+        ci.invoice_id
+),
+matched_hitl_entries AS (
+    SELECT DISTINCT ON (rqi.quarantine_id)
+        rqi.quarantine_id,
+        rqi.document_number,
+        rqi.reviewed_by,
+        rqi.reviewed_at,
+        rqi.invoice_total,
+        je.entry_id AS journal_entry_id,
+        je.transaction_date,
+        je.status AS journal_status
+    FROM resolved_quarantine_invoices rqi
+    JOIN journal_entries je
+        ON je.reference_document_id = rqi.document_number
+       AND je.description LIKE 'HITL Override Ingestion%'
+    ORDER BY
+        rqi.quarantine_id,
+        ABS(EXTRACT(EPOCH FROM (je.created_at - rqi.reviewed_at))) ASC,
+        je.created_at DESC,
+        je.entry_id
+),
+ledger_entry_totals AS (
+    SELECT
+        jl.entry_id,
+        COUNT(jl.line_id) AS line_count,
+        COALESCE(SUM(jl.debit_amount), 0.0000) AS total_debits,
+        COALESCE(SUM(jl.credit_amount), 0.0000) AS total_credits,
+        ABS(COALESCE(SUM(jl.debit_amount), 0.0000) - COALESCE(SUM(jl.credit_amount), 0.0000)) AS zero_sum_delta,
+        STRING_AGG(DISTINCT jl.account_code, ', ' ORDER BY jl.account_code) AS account_codes
+    FROM journal_lines jl
+    GROUP BY jl.entry_id
 )
-SELECT 
-    hi.quarantine_id,
-    hi.document_number,
-    hi.reviewed_by,
-    hi.reviewed_at,
-    je.entry_id AS journal_entry_id,
-    je.transaction_date,
-    je.status AS journal_status,
-    jl.line_order,
-    jl.account_code,
-    a.account_name,
-    jl.debit_amount,
-    jl.credit_amount,
-    jl.currency_code,
-    jl.exchange_rate_applied
-FROM hitl_invoices hi
-JOIN journal_entries je 
-    ON je.reference_document_id = hi.document_number
-JOIN journal_lines jl 
-    ON je.entry_id = jl.entry_id
-LEFT JOIN accounts a 
-    ON jl.account_code = a.account_code
-ORDER BY hi.quarantine_id, jl.line_order;
+SELECT
+    mhe.quarantine_id,
+    mhe.document_number,
+    mhe.reviewed_by,
+    mhe.reviewed_at,
+    mhe.invoice_total,
+    mhe.journal_entry_id,
+    mhe.transaction_date,
+    mhe.journal_status,
+    COALESCE(let.line_count, 0) AS line_count,
+    COALESCE(let.total_debits, 0.0000) AS total_debits,
+    COALESCE(let.total_credits, 0.0000) AS total_credits,
+    COALESCE(let.zero_sum_delta, 0.0000) AS zero_sum_delta,
+    let.account_codes
+FROM matched_hitl_entries mhe
+LEFT JOIN ledger_entry_totals let
+    ON mhe.journal_entry_id = let.entry_id
+ORDER BY mhe.quarantine_id;
 
 -- 5. Invariante de Soma Zero Fiduciária dos Lançamentos Gerados por HITL Override
-SELECT 
+WITH ledger_entry_totals AS (
+    SELECT
+        jl.entry_id,
+        COUNT(jl.line_id) AS line_count,
+        COALESCE(SUM(jl.debit_amount), 0.0000) AS total_debits,
+        COALESCE(SUM(jl.credit_amount), 0.0000) AS total_credits
+    FROM journal_lines jl
+    GROUP BY jl.entry_id
+)
+SELECT
     je.entry_id,
     je.reference_document_id,
-    SUM(jl.debit_amount) AS total_debits,
-    SUM(jl.credit_amount) AS total_credits,
-    (SUM(jl.debit_amount) - SUM(jl.credit_amount)) AS zero_sum_delta,
-    CASE 
-        WHEN ABS(SUM(jl.debit_amount) - SUM(jl.credit_amount)) <= 0.0001 THEN 'BALANCED_ACID'
+    COALESCE(let.line_count, 0) AS line_count,
+    COALESCE(let.total_debits, 0.0000) AS total_debits,
+    COALESCE(let.total_credits, 0.0000) AS total_credits,
+    (COALESCE(let.total_debits, 0.0000) - COALESCE(let.total_credits, 0.0000)) AS zero_sum_delta,
+    CASE
+        WHEN COALESCE(let.line_count, 0) >= 2
+         AND ABS(COALESCE(let.total_debits, 0.0000) - COALESCE(let.total_credits, 0.0000)) <= 0.0001 THEN 'BALANCED_ACID'
         ELSE 'UNBALANCED_ERROR'
     END AS fiduciary_status
 FROM journal_entries je
-JOIN journal_lines jl ON je.entry_id = jl.entry_id
-WHERE je.description LIKE 'HITL Override Ingestion%'
-GROUP BY je.entry_id, je.reference_document_id;
+LEFT JOIN ledger_entry_totals let ON je.entry_id = let.entry_id
+WHERE je.description LIKE 'HITL Override Ingestion%';

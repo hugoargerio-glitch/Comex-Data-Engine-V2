@@ -5,16 +5,17 @@
 -- ==============================================================================
 
 -- 1. View da Tabela Fato de Operações Aduaneiras (Particionamento Hive year/month)
+-- Execute a partir da raiz do projeto comex-data-engine-v2 (ou ajuste o diretório de trabalho).
 CREATE OR REPLACE VIEW fact_comex_operations AS 
 SELECT * FROM read_parquet(
-    '/home/Hugo/comex-data-engine-v2/data/parquet_lakehouse/fact_comex_operations/**/*.parquet', 
+    './data/parquet_lakehouse/fact_comex_operations/**/*.parquet', 
     hive_partitioning = 1
 );
 
 -- 2. View da Dimensão Câmbio PTAX (Séries Históricas Diárias com LOCF)
 CREATE OR REPLACE VIEW dim_currency_ptax AS 
 SELECT * FROM read_parquet(
-    '/home/Hugo/comex-data-engine-v2/data/parquet_lakehouse/dim_currency_ptax/**/*.parquet', 
+    './data/parquet_lakehouse/dim_currency_ptax/**/*.parquet', 
     hive_partitioning = 1
 );
 

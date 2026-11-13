@@ -25,26 +25,30 @@ GROUP BY a.account_code, a.account_name, a.account_type, a.normal_balance
 ORDER BY a.account_code;
 
 -- 2. Prova de Fogo: Auditoria de Soma Zero Transação por Transação (Zero-Sum Invariant)
--- EXPECTATIVA: ZERO linhas retornadas! Se retornar qualquer linha, houve quebra do razão.
+-- EXPECTATIVA: ZERO linhas retornadas! Usa LEFT JOIN e verifica status = 'POSTED' para detectar cabeçalhos com 0 ou 1 linha e desequilíbrios.
 SELECT 
     je.entry_id,
     je.competence_date,
     je.description,
     je.status,
     COUNT(jl.line_id) AS qtd_linhas,
-    SUM(jl.debit_amount) AS soma_debitos,
-    SUM(jl.credit_amount) AS soma_creditos,
-    ABS(SUM(jl.debit_amount) - SUM(jl.credit_amount)) AS delta_divergencia
+    COALESCE(SUM(jl.debit_amount), 0.0000) AS soma_debitos,
+    COALESCE(SUM(jl.credit_amount), 0.0000) AS soma_creditos,
+    ABS(COALESCE(SUM(jl.debit_amount), 0.0000) - COALESCE(SUM(jl.credit_amount), 0.0000)) AS delta_divergencia
 FROM journal_entries je
-JOIN journal_lines jl ON je.entry_id = jl.entry_id
+LEFT JOIN journal_lines jl ON je.entry_id = jl.entry_id
+WHERE je.status = 'POSTED'
 GROUP BY je.entry_id, je.competence_date, je.description, je.status
-HAVING ABS(SUM(jl.debit_amount) - SUM(jl.credit_amount)) > 0.0001;
+HAVING COUNT(jl.line_id) < 2
+    OR ABS(COALESCE(SUM(jl.debit_amount), 0.0000) - COALESCE(SUM(jl.credit_amount), 0.0000)) > 0.0001;
 
 -- 3. Fechamento Global do Razão
 SELECT 
-    COUNT(DISTINCT entry_id) AS total_transacoes_posted,
-    COUNT(line_id) AS total_linhas_escrituradas,
-    SUM(debit_amount) AS soma_global_debitos,
-    SUM(credit_amount) AS soma_global_creditos,
-    (SUM(debit_amount) - SUM(credit_amount)) AS diferenca_final_zero_absoluto
-FROM journal_lines;
+    COUNT(DISTINCT je.entry_id) FILTER (WHERE je.status = 'POSTED') AS total_transacoes_posted,
+    COUNT(DISTINCT je.entry_id) FILTER (WHERE je.status = 'REVERSED') AS total_transacoes_reversed,
+    COUNT(jl.line_id) AS total_linhas_escrituradas,
+    COALESCE(SUM(jl.debit_amount), 0.0000) AS soma_global_debitos,
+    COALESCE(SUM(jl.credit_amount), 0.0000) AS soma_global_creditos,
+    COALESCE(SUM(jl.debit_amount) - SUM(jl.credit_amount), 0.0000) AS diferenca_final_zero_absoluto
+FROM journal_entries je
+LEFT JOIN journal_lines jl ON je.entry_id = jl.entry_id;
