@@ -4,30 +4,30 @@ Conforms to ODCS v3.2.0 (comex_fiduciary_engine_v2) & semantic_rules.md.
 
 Mandates:
 - Zero IEEE 754 float types (DECIMAL(19,6) for exchange rates).
-- Resilient API extraction via ResilientAPIExtractor (tenacity backoff + full jitter).
+- Resilient API extraction via ResilientAPIExtractor.extract_and_land (MongoDB Raw Landing + @odata.nextLink pagination).
 - Selection of daily closing bulletin ('Fechamento' or latest dataHoraCotacao).
 - LOCF forward-fill across weekends/holidays with zero lookahead bias.
 - dim_date reference foreign-key satisfaction in PostgreSQL.
 - Idempotent upsert into PostgreSQL dim_currency_ptax and Parquet Hive Lakehouse.
-- Seamless offline fallback to samples/bacen_ptax_sample.json when network is unavailable.
+- Strict offline mode: sample fallback is used ONLY when offline=True (or offline_fallback=True),
+  and stale sample rates never propagate into unrelated future dates.
 """
 
 import argparse
 import collections
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 import json
 import logging
 from pathlib import Path
-import sys
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
 import httpx
 from sqlalchemy import text
-from sqlalchemy.engine import Engine
+from sqlalchemy.exc import InterfaceError, OperationalError
 
 from src.connectors.postgres import engine as default_postgres_engine
-from src.extractors.http_client import ResilientAPIExtractor, RetryableHTTPError
+from src.extractors.http_client import ResilientAPIExtractor
 from src.models.customs import (
     PTAXRateInput,
     VALID_PTAX_CURRENCIES,
@@ -40,14 +40,22 @@ logger = logging.getLogger("comex.extractors.bacen_ptax")
 DEFAULT_BASE_URL = "https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata"
 DEFAULT_SAMPLE_PATH = Path(__file__).resolve().parent.parent.parent / "samples" / "bacen_ptax_sample.json"
 
+_UNSET = object()
 
-def ensure_dim_date_range(engine_or_conn: Any, start_date: date, end_date: date) -> None:
+
+def ensure_dim_date_range(
+    engine_or_conn: Any,
+    start_date: date,
+    end_date: date,
+    offline: bool = False,
+    explicit_engine: bool = False,
+) -> None:
     """
     Ensures dim_date records exist in PostgreSQL for [start_date, end_date]
     prior to persisting dim_currency_ptax, ensuring dim_currency_ptax_date_id_fkey
     is always satisfied without foreign key violations.
     """
-    if engine_or_conn is None:
+    if engine_or_conn is None or start_date > end_date:
         return
 
     rows: List[Dict[str, Any]] = []
@@ -75,17 +83,21 @@ def ensure_dim_date_range(engine_or_conn: Any, start_date: date, end_date: date)
         """
     )
 
-    if hasattr(engine_or_conn, "execute") and not hasattr(engine_or_conn, "begin"):
-        try:
+    try:
+        if hasattr(engine_or_conn, "execute") and not hasattr(engine_or_conn, "begin"):
             engine_or_conn.execute(insert_sql, rows)
-        except Exception as exc:
-            logger.warning(f"dim_date postgres check skipped/warning on conn: {exc}")
-    else:
-        try:
+        else:
             with engine_or_conn.begin() as conn:
                 conn.execute(insert_sql, rows)
-        except Exception as exc:
-            logger.warning(f"dim_date postgres check skipped/warning on engine: {exc}")
+    except (OperationalError, InterfaceError) as exc:
+        if offline and not explicit_engine:
+            logger.warning("PostgreSQL unreachable during offline dim_date sync; skipping: %s", exc)
+            return
+        logger.error("PostgreSQL dim_date upsert failed: %s", exc)
+        raise
+    except Exception as exc:
+        logger.error("PostgreSQL dim_date upsert failed: %s", exc)
+        raise
 
 
 def parse_olinda_ptax_items(
@@ -126,6 +138,9 @@ def parse_olinda_ptax_items(
         candidates = fechamento if fechamento else day_items
         best = max(candidates, key=lambda x: str(x.get("dataHoraCotacao", "")))
 
+        if best.get("cotacaoCompra") is None or best.get("cotacaoVenda") is None:
+            raise ValueError(f"Missing cotacaoCompra/cotacaoVenda in BACEN PTAX item for {code} on {d}: {best}")
+
         # Anti-Float rule: convert via str() into Decimal, strictly quantize to Decimal("0.000001")
         buy_raw = str(best["cotacaoCompra"])
         sell_raw = str(best["cotacaoVenda"])
@@ -154,8 +169,8 @@ def parse_olinda_ptax_items(
 
 class BacenPTAXClient:
     """
-    Live BACEN Olinda PTAX Extractor & Synchronizer with LOCF forward-fill,
-    resilient backoff retries, and seamless offline sample fallback.
+    Live BACEN Olinda PTAX Extractor & Synchronizer with MongoDB Raw Landing,
+    @odata.nextLink pagination, LOCF forward-fill, and explicit offline sample mode.
     """
 
     def __init__(
@@ -166,14 +181,29 @@ class BacenPTAXClient:
         offline_fallback: bool = False,
         sample_path: Optional[Union[str, Path]] = None,
         processor: Optional[ComexHTAPProcessor] = None,
-        engine: Optional[Engine] = None,
+        engine: Any = _UNSET,
+        offline: Optional[bool] = None,
+        mongo_collection: str = "raw_bacen_ptax",
     ) -> None:
+        is_offline = offline if offline is not None else offline_fallback
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
-        self.offline_fallback = offline_fallback
+        self.offline = bool(is_offline)
+        self.offline_fallback = self.offline
         self.sample_path = Path(sample_path) if sample_path else DEFAULT_SAMPLE_PATH
-        self.processor = processor or ComexHTAPProcessor()
-        self.engine = engine or default_postgres_engine
+        self._explicit_engine = engine is not _UNSET
+        self.engine = default_postgres_engine if engine is _UNSET else engine
+        self.mongo_collection = mongo_collection
+
+        if processor is not None:
+            self.processor = processor
+        else:
+            self.processor = ComexHTAPProcessor(
+                source_system="BACEN_OLINDA_PTAX",
+                engine=self.engine,
+            )
+            self.processor.engine = self.engine
+
         self._http_client = client
         self.extractor = ResilientAPIExtractor(
             source_system="BACEN_OLINDA_PTAX",
@@ -189,8 +219,9 @@ class BacenPTAXClient:
         end_date: date,
     ) -> List[Dict[str, Any]]:
         """
-        Executes HTTP GET on BACEN Olinda CotacaoMoedaPeriodo endpoint.
-        Formatted parameters: @moeda='USD', @dataInicial='MM-DD-YYYY', @dataFinalCotacao='MM-DD-YYYY'.
+        Executes HTTP GET on BACEN Olinda CotacaoMoedaPeriodo endpoint,
+        landing every raw response page idempotently in MongoDB via extract_and_land()
+        and following @odata.nextLink pagination until exhaustion.
         """
         code = currency_code.upper().strip()
         if code not in VALID_PTAX_CURRENCIES:
@@ -205,12 +236,51 @@ class BacenPTAXClient:
             "$format": "json",
         }
 
-        data = self.extractor.fetch_json(endpoint=endpoint, params=params)
-        if isinstance(data, dict):
-            return data.get("value") or data.get("items") or []
-        if isinstance(data, list):
-            return data
-        return []
+        landed = self.extractor.extract_and_land(
+            endpoint=endpoint,
+            params=params,
+            collection_name=self.mongo_collection,
+        )
+        payload = landed["raw_payload"]
+
+        items: List[Dict[str, Any]] = []
+        seen_links: Set[str] = set()
+        page_count = 0
+        max_pages = 1000
+
+        while True:
+            page_count += 1
+            if isinstance(payload, dict):
+                page_items = payload.get("value") or payload.get("items") or []
+                if isinstance(page_items, list):
+                    items.extend(page_items)
+                next_link = payload.get("@odata.nextLink")
+            elif isinstance(payload, list):
+                items.extend(payload)
+                next_link = None
+            else:
+                next_link = None
+
+            if not next_link:
+                break
+
+            next_url = str(next_link).strip()
+            if not next_url:
+                break
+            if next_url in seen_links:
+                raise ValueError(f"Pagination cycle detected in @odata.nextLink: {next_url}")
+            if page_count >= max_pages:
+                raise RuntimeError(f"Exceeded max OData pagination limit ({max_pages}) for {code}")
+
+            seen_links.add(next_url)
+            next_landed = self.extractor.extract_and_land(
+                endpoint=next_url,
+                params=None,
+                collection_name=self.mongo_collection,
+            )
+            payload = next_landed["raw_payload"]
+
+        return items
 
     def load_offline_sample(
         self,
@@ -219,9 +289,13 @@ class BacenPTAXClient:
         end_date: date,
     ) -> List[PTAXRateInput]:
         """
-        Loads PTAX rates from samples/bacen_ptax_sample.json and applies
-        LOCF forward-fill if any calendar days are missing in the requested interval.
+        Loads PTAX rates from samples/bacen_ptax_sample.json when offline=True.
+        Rejects requests whose interval falls outside the sample's temporal coverage
+        so stale sample rates never propagate into unrelated dates.
         """
+        if start_date > end_date:
+            raise ValueError(f"start_date ({start_date}) must be <= end_date ({end_date}).")
+
         code = currency_code.upper().strip()
         if not self.sample_path.exists():
             raise FileNotFoundError(f"Offline PTAX sample file not found: {self.sample_path}")
@@ -234,8 +308,31 @@ class BacenPTAXClient:
             raise ValueError(f"No sample rates found for currency {code} in {self.sample_path}")
 
         parsed_rates = [PTAXRateInput.model_validate(item) for item in raw_matching]
+        sample_dates = sorted(
+            date(r.date_id // 10000, (r.date_id % 10000) // 100, r.date_id % 100)
+            for r in parsed_rates
+        )
+        min_sample_date = sample_dates[0]
+        max_sample_date = sample_dates[-1]
 
-        # Check if the requested range is already fully satisfied by the sample
+        if start_date < min_sample_date:
+            raise ValueError(
+                f"Offline sample {self.sample_path} for {code} starts at {min_sample_date}; "
+                f"cannot satisfy requested start_date {start_date}."
+            )
+        if end_date > max_sample_date:
+            extra_days = (end_date - max_sample_date).days
+            is_trailing_weekend = (
+                max_sample_date.weekday() == 4
+                and extra_days <= 2
+                and all((max_sample_date + timedelta(days=i)).weekday() >= 5 for i in range(1, extra_days + 1))
+            )
+            if not is_trailing_weekend:
+                raise ValueError(
+                    f"Offline sample {self.sample_path} for {code} covers up to {max_sample_date}; "
+                    f"refusing to propagate stale sample rates to {end_date}."
+                )
+
         matching_range = [
             r for r in parsed_rates
             if start_date <= date(r.date_id // 10000, (r.date_id % 10000) // 100, r.date_id % 100) <= end_date
@@ -244,7 +341,6 @@ class BacenPTAXClient:
         if len(matching_range) == expected_days:
             return sorted(matching_range, key=lambda x: x.date_id)
 
-        # Forward fill across any gaps using LOCF
         return apply_locf_forward_fill(
             rates=parsed_rates,
             start_date=start_date,
@@ -259,27 +355,22 @@ class BacenPTAXClient:
         end_date: date,
     ) -> List[PTAXRateInput]:
         """
-        Fetches PTAX rates for a single currency, falling back seamlessly
-        to offline sample when offline_fallback=True or network is unavailable.
+        Fetches PTAX rates for a single currency.
+        Uses offline sample ONLY when offline=True (or offline_fallback=True);
+        in live mode, network, Mongo landing, empty responses, and LOCF failures raise loudly.
         """
         code = currency_code.upper().strip()
-        if self.offline_fallback:
-            logger.info(f"Offline fallback mode active; loading {code} from {self.sample_path}")
+        if self.offline:
+            logger.info("Offline mode active; loading %s from %s", code, self.sample_path)
             return self.load_offline_sample(code, start_date, end_date)
 
-        try:
-            raw_items = self.fetch_raw_ptax(code, start_date, end_date)
-            if not raw_items:
-                logger.warning(f"Empty raw items returned from BACEN for {code}; falling back to sample.")
-                return self.load_offline_sample(code, start_date, end_date)
-
-            return parse_olinda_ptax_items(raw_items, code, start_date, end_date)
-        except Exception as exc:
-            logger.warning(
-                f"BACEN Olinda live fetch failed ({exc.__class__.__name__}: {exc}); "
-                f"seamlessly falling back to offline sample {self.sample_path}"
+        raw_items = self.fetch_raw_ptax(code, start_date, end_date)
+        if not raw_items:
+            raise ValueError(
+                f"BACEN Olinda returned no PTAX quotations for {code} between {start_date} and {end_date}."
             )
-            return self.load_offline_sample(code, start_date, end_date)
+
+        return parse_olinda_ptax_items(raw_items, code, start_date, end_date)
 
     def sync_ptax_period(
         self,
@@ -290,7 +381,7 @@ class BacenPTAXClient:
     ) -> List[PTAXRateInput]:
         """
         Synchronizes PTAX rates for all specified currencies across [start_date, end_date].
-        1. Queries BACEN Olinda (or loads offline fallback).
+        1. Queries BACEN Olinda + lands raw pages in MongoDB (or loads sample if offline=True).
         2. Applies LOCF forward-fill across weekends and holidays.
         3. Ensures dim_date rows exist in PostgreSQL.
         4. Upserts idempotently into dim_currency_ptax and mirrors to Parquet Hive Lakehouse.
@@ -302,13 +393,17 @@ class BacenPTAXClient:
             rates = self.fetch_ptax_for_currency(curr, start_date, end_date)
             all_rates.extend(rates)
 
-        # Ensure foreign key dim_date satisfaction
         target_db = conn if conn is not None else self.engine
-        ensure_dim_date_range(target_db, start_date, end_date)
+        if target_db is not None:
+            ensure_dim_date_range(
+                target_db,
+                start_date,
+                end_date,
+                offline=self.offline,
+                explicit_engine=self._explicit_engine,
+            )
 
-        # Persist to PostgreSQL and mirror to Parquet Lakehouse
         self.processor.persist_ptax_rates(all_rates, conn=conn)
-
         return all_rates
 
 
@@ -339,7 +434,7 @@ def main() -> None:
     parser.add_argument(
         "--offline",
         action="store_true",
-        help="Force offline fallback using samples/bacen_ptax_sample.json",
+        help="Use offline sample data from samples/bacen_ptax_sample.json",
     )
     parser.add_argument(
         "--sample-path",
@@ -363,7 +458,7 @@ def main() -> None:
     print("=" * 74)
 
     client = BacenPTAXClient(
-        offline_fallback=args.offline,
+        offline=args.offline,
         sample_path=args.sample_path,
     )
 
