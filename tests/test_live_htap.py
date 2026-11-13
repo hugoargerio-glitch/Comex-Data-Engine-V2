@@ -130,6 +130,7 @@ def test_live_postgres_append_only_trigger():
             .all()
         )
         assert len(triggers) == 7, f"Missing fiduciary PostgreSQL triggers: found {sorted(triggers)}"
+        conn.rollback()
 
         trans = conn.begin()
         try:
@@ -557,14 +558,18 @@ def test_live_seed_twice_idempotency_and_rejected_hitl_enum():
             ).scalar_one()
             assert zero_sum == Decimal("0.0000")
 
-            check_def = conn.execute(
-                text(
-                    "SELECT pg_get_constraintdef(c.oid) FROM pg_constraint c "
-                    "JOIN pg_class t ON c.conrelid = t.oid "
-                    "WHERE t.relname = 'comex_quarantine_hitl' AND c.contype = 'c' "
-                    "AND pg_get_constraintdef(c.oid) LIKE '%review_status%'"
+            check_def = " ".join(
+                conn.execute(
+                    text(
+                        "SELECT pg_get_constraintdef(c.oid) FROM pg_constraint c "
+                        "JOIN pg_class t ON c.conrelid = t.oid "
+                        "WHERE t.relname = 'comex_quarantine_hitl' AND c.contype = 'c' "
+                        "AND pg_get_constraintdef(c.oid) LIKE '%review_status%'"
+                    )
                 )
-            ).scalar_one()
+                .scalars()
+                .all()
+            )
             assert "REJECTED_HITL" in check_def
 
         for col_name in ("raw_commercial_invoices", "raw_swift_statements"):
