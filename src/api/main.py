@@ -480,7 +480,7 @@ class SwiftReconciliationRequest(BaseModel):
     def _validate_gross(cls, v: Any) -> Decimal:
         val = parse_strict_decimal(
             v,
-            scale=4,
+            scale=Decimal("0.0001"),
             max_value=MAX_NUMERIC_19_4,
             strictly_positive=True,
             field_label="gross_amount",
@@ -493,7 +493,7 @@ class SwiftReconciliationRequest(BaseModel):
     def _validate_fee(cls, v: Any) -> Decimal:
         val = parse_strict_decimal(
             v,
-            scale=4,
+            scale=Decimal("0.0001"),
             max_value=MAX_NUMERIC_19_4,
             min_value=Decimal("0.0000"),
             strictly_positive=False,
@@ -507,7 +507,7 @@ class SwiftReconciliationRequest(BaseModel):
     def _validate_fx(cls, v: Any) -> Decimal:
         val = parse_strict_decimal(
             v,
-            scale=6,
+            scale=Decimal("0.000001"),
             max_value=MAX_NUMERIC_19_6,
             strictly_positive=True,
             field_label="exchange_rate",
