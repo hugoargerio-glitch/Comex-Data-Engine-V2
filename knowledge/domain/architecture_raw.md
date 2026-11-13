@@ -34,7 +34,7 @@ Na engenharia de dados aplicada ao Comércio Exterior (**COMEX**) e à contabili
 1. **Sistemas Puramente Analíticos (Batch ETL Clássico)**: Baixam arquivos CSV/Parquet brutos de comércio exterior (MDIC / Comex Stat) sem rigor transacional, utilizando aritmética de ponto flutuante (`float` IEEE 754) que corrompe conciliações cambiais por frações de centavo, e ignoram o ciclo de vida contábil das faturas comerciais (*Commercial Invoices*).
 2. **Sistemas Puramente Transacionais (ERP/CRUD Isolado)**: Registram documentos fiscais sem capacidade de processamento analítico colunar sobre milhões de linhas históricas de NCMs, fretes internacionais e séries temporais de câmbio (**PTAX / BACEN**), além de sobrescreverem saldos com instruções destrutivas (`UPDATE balance = ...`) que destroem a trilha de auditoria (*Audit Trail*).
 
-O **Comex Data Engine V2** supera essa dicotomia implementando uma arquitetura **Hybrid Transactional/Analytical Processing (HTAP) & Fiduciary Medallion**, combinando o **Core Transacional ACID em PostgreSQL 16** (Idempotência Dupla, Razão Contábil por Partidas Dobradas Imutável, Conciliação Cambial Multi-Moeda e Fila Human-in-the-Loop) com o **Core Analítico Colunar em Apache Parquet + DuckDB + dbt Core** (Star Schema Kimball, Partition Pruning no padrão Hive e inteligência mercantil de *Landed Cost*).
+O **Comex Data Engine V2** supera essa dicotomia implementando uma arquitetura **Hybrid Transactional/Analytical Processing (HTAP) & Fiduciary Medallion**, combinando o **Core Transacional ACID em PostgreSQL 16** (Idempotência Dupla, Razão Contábil por Partidas Dobradas Imutável, Conciliação Cambial Multi-Moeda e Fila Human-in-the-Loop) com o **Core Analítico Colunar em Apache Parquet + DuckDB** (Star Schema Kimball, Partition Pruning no padrão Hive e inteligência mercantil de *Landed Cost*).
 
 | Dimensão Arquitetural | Pipeline Comex Convencional (V1 / Legado) | Comex Resilient Data & Fiduciary Engine (V2) |
 | :--- | :--- | :--- |
@@ -43,7 +43,7 @@ O **Comex Data Engine V2** supera essa dicotomia implementando uma arquitetura *
 | **Garantia de Idempotência** | Sobrescrita simples de arquivo por data | **Barreira Dupla ($f(f(x)) = f(x)$)**: Hash `SHA-256` do payload bruto na borda + `UNIQUE CONSTRAINT` semântica com `ON CONFLICT DO UPDATE` |
 | **Escrituração Financeira** | Inexistente ou atualização destrutiva de coluna | **Append-Only Double-Entry Ledger**: Partidas dobradas com invariante $\sum \text{Débitos} - \sum \text{Créditos} = 0$ e estornos (*Reversal Entries*) |
 | **Resiliência de Rede & IA** | Retry simples de conexão HTTP | **Exponential Backoff + Full Jitter** (`tenacity`) para rede + **Agentic Self-Correction Loop** reinjetando `ValidationError` em extrações estruturadas |
-| **Governança de Exceções** | Falha ruidosa do script (`exit(1)`) ou descarte silencioso | **Shift-Left Quarantine & HITL**: Divergências aritméticas ou de Incoterms desviadas para fila `human_review_quarantine` |
+| **Governança de Exceções** | Falha ruidosa do script (`exit(1)`) ou descarte silencioso | **Shift-Left Quarantine & HITL**: Divergências aritméticas ou de Incoterms desviadas para fila `comex_quarantine_hitl` |
 | **Motor de Armazenamento** | Arquivos Parquet soltos | **Multi-Model HTAP**: **MongoDB 7** (Landing Zone NoSQL de Payloads Brutos) + **PostgreSQL 16** (Estado Transacional, Ledger & Star Schema) + **Apache Parquet Hive + DuckDB** (OLAP Histórico) |
 
 ---
@@ -79,9 +79,9 @@ flowchart TD
         INC --> LED["Razão Contábil Imutável (Append-Only Double-Entry Ledger)<br/>Tabelas: accounts, journal_entries, journal_lines<br/>Invariante ACID: SUM(debit_amount) - SUM(credit_amount) == 0.0000"]
     end
 
-    subgraph L5["5. CAMADA ANALÍTICA COLUNAR & SERVING (Parquet Hive + DuckDB + dbt + Star Schema)"]
+    subgraph L5["5. CAMADA ANALÍTICA COLUNAR & SERVING (Parquet Hive + DuckDB + Star Schema)"]
         PYD -->|Stream PyArrow 64MB Chunks| PARQ["Bronze/Silver Lakehouse Local<br/>Apache Parquet (Snappy) Particionado Hive: year=YYYY/month=MM"]
-        PARQ & LED --> DBT["Motor Analítico OLAP (DuckDB + dbt Core / SQL Star Schema)<br/>• fact_comex_operations & fact_fx_reconciliation<br/>• dim_merchandise_ncm, dim_currency_ptax (LOCF Forward-Fill), dim_partner_country, dim_date"]
+        PARQ & LED --> DBT["Motor Analítico OLAP (DuckDB + SQL Star Schema)<br/>• fact_comex_operations & customs_nationalizations<br/>• dim_merchandise_ncm, dim_currency_ptax (LOCF Forward-Fill), dim_partner_country, dim_date"]
     end
 
     classDef source fill:#34495e,stroke:#2c3e50,stroke-width:2px,color:#fff;
@@ -112,7 +112,7 @@ A inclusão do **MongoDB 7** como banco orientado a documentos resolve um desafi
    - O documento bruto é salvo imediatamente na coleção `raw_commercial_invoices` ou `raw_swift_statements` no MongoDB com seu `payload_hash` SHA-256 e metadata de recepção.
    - O endpoint responde `HTTP 201 Created` retornando o `raw_id` gerado pelo Mongo.
 2. **Inspeção Táctil com MongoDB Compass**:
-   Em vez de você operar no escuro via terminal, você abre o **MongoDB Compass** na sua máquina conectando em `mongodb://localhost:27017`:
+   Em vez de você operar no escuro via terminal, você abre o **MongoDB Compass** na sua máquina conectando em `mongodb://comex_mongo_user:comex_mongo_pass@localhost:27018/comex_raw_lake?authSource=admin`:
    - Banco de Dados: `comex_raw_lake`.
    - Coleções:
      - `raw_commercial_invoices`: visualize a árvore JSON completa da fatura, atributos de cabeçalho, arrays de itens e tags fiscais.
@@ -164,7 +164,7 @@ Para impedir que reprocessamentos de rede, webhooks duplicados ou *backfills* hi
 3. **Nível 3 — Idempotência Analítica de Operações Aduaneiras (`operation_hash_id`)**:
    Na tabela fato `fact_comex_operations`, cada registro estatístico do MDIC recebe uma chave determinística:
    $$\text{operation\_hash\_id} = \text{SHA-256}(\text{ano} \parallel \text{mes} \parallel \text{tipo\_op} \parallel \text{co\_ncm} \parallel \text{co\_pais} \parallel \text{sg\_uf} \parallel \text{co\_via} \parallel \text{co\_urf})$$
-   Garantindo que cargas repetidas via `INSERT ... ON CONFLICT (operation_hash_id) DO UPDATE` ou `MERGE INTO` no DuckDB/dbt sejam 100% idempotentes.
+   Garantindo que cargas repetidas via `INSERT ... ON CONFLICT (operation_hash_id) DO UPDATE` no PostgreSQL 16 ou merge por chave natural em Parquet/DuckDB sejam 100% idempotentes.
 
 ---
 
@@ -237,7 +237,7 @@ O projeto resolve três problemas reais de finanças internacionais e comércio 
 
 | Vetor de Decisão | Option A: Abordagem Ingênua (Anti-Pattern) | Option B: Over-Engineering Distribuído (Cloud Heavy) | Option C: Arquitetura Selecionada (Hybrid HTAP & Fiduciary Medallion) |
 | :--- | :--- | :--- | :--- |
-| **1. Armazenamento & Persistência** | Apenas CSVs/Parquets locais sem banco relacional ou apenas SQLite sem suporte a concorrência de rede e tipos `NUMERIC` estritos. | Cluster Spark/Databricks + Cloud Data Warehouse pago 24/7 para dados que cabem em memória/SSD local. | **PostgreSQL 16 (Docker)** para transações ACID, Upsert e Double-Entry Ledger + **Parquet Hive & DuckDB/dbt** para OLAP vetorial de alta velocidade. |
+| **1. Armazenamento & Persistência** | Apenas CSVs/Parquets locais sem banco relacional ou apenas SQLite sem suporte a concorrência de rede e tipos `NUMERIC` estritos. | Cluster Spark/Databricks + Cloud Data Warehouse pago 24/7 para dados que cabem em memória/SSD local. | **PostgreSQL 16 (Docker, porta 5434)** para transações ACID, Alembic, triggers e Double-Entry Ledger + **Parquet Hive & DuckDB** para OLAP vetorial de alta velocidade. |
 | **2. Representação Monetária** | Tipo `float` nativo do Python e `REAL`/`DOUBLE PRECISION` no banco de dados. | Biblioteca externa pesada de computação simbólica. | **`decimal.Decimal` (Python/Pydantic)** + **`NUMERIC(19,4)` (PostgreSQL/DuckDB)** + **`BIGINT` (Centavos)** validados por contrato ODCS v3.2.0. |
 | **3. Conciliação Cambial & SWIFT** | Comparar valor faturado e valor liquidado com `==`; falhar toda conciliação quando houver variação cambial ou tarifa SWIFT. | Regras manuais ad-hoc em planilhas fora do pipeline. | **Motor de Conciliação em 2 Estágios**: Separação temporal Competência ($t_1$ PTAX) vs. Caixa ($t_2$ Spot) + *Fuzzy Tolerance Matching* para tarifas SWIFT com *Split Journal Entry*. |
 | **4. Tratamento de Falhas de IA/Schema** | Retry cego com o mesmo prompt (queima de tokens) ou inserção de dados parciais no banco. | Intervenção manual em 100% dos documentos sem triagem automática. | **Self-Correction Loop** (reinjeta o `ValidationError` do Pydantic no prompt) + **Fila de Quarentena HITL** (`comex_quarantine_hitl`) para divergências reais. |
@@ -249,126 +249,149 @@ O projeto resolve três problemas reais de finanças internacionais e comércio 
 
 Seguindo a diretriz da nota `00.5 - Limites, Pontos Fracos e Matriz de Adaptação do Boilerplate`:
 
-1. **O que permanece 100% Intacto (Camada 1 — Governança Agêntica)**:
-   - `AGENTS.md` como única fonte canônica de runtime, governando os 4 subagentes isolados (`planner`, `worker`, `auditor`, `dataops`).
+1. **Camada 1 — Contratos Executáveis & Governança Semântica**:
    - Especificação pré-código via contrato executável **ODCS v3.2.0** (`./contracts/comex_fiduciary_engine_v2.odcs.yaml`).
-   - Memória semântica versionada em `./knowledge/domain/semantic_rules.md` utilizando estritamente pares `MANDATE:` e `!ANTI_PATTERN:`.
-   - Isolamento de desenvolvimento paralelo em **Git Worktrees** (`git worktree add`) com parametrização de portas Docker (`COMPOSE_PROJECT_NAME`).
-2. **Como a Camada Física (Camada 2) Opera no Perfil Híbrido (Profile 2 + Core ACID PostgreSQL)**:
-   - **PostgreSQL 16 (Containerizado via Docker Compose / SQLite Fallback de Teste Rápido)**: Hospeda o schema transacional e fiduciário (`commercial_invoices`, `accounts`, `journal_entries`, `journal_lines`, `swift_bank_statements`, `comex_quarantine_hitl`) e as tabelas dimensionais servidas para BI (`fact_comex_operations`, `dim_merchandise_ncm`, `dim_currency_ptax`, `dim_date`).
-   - **PyArrow + DuckDB + dbt Core**: Realiza a ingestão em streaming de arquivos massivos do MDIC (blocos de 64MB), grava em **Apache Parquet (Snappy)** particionado no padrão Hive (`year=YYYY/month=MM`) e executa transformações analíticas OLAP e testes de contrato em sub-segundo.
-   - **FastAPI REST Layer (`src/api/app.py`)**: Expõe endpoints determinísticos documentados com OpenAPI/Swagger (`/health`, `/api/v2/invoices/ingest`, `/api/v2/reconciliation/swift`, `/api/v2/ledger/trial-balance`, `/api/v2/analytics/landed-cost`) prontos para consumo por interfaces web ou agentes.
+   - Memória semântica versionada em `./knowledge/domain/semantic_rules.md` utilizando estritamente pares `MANDATE:` e `!ANTI_PATTERN:`, complementada pelos runbooks em `./knowledge/runbooks/`.
+   - Migrações versionadas de schema via **Alembic** (`./alembic/`) sincronizadas com `./sql/ddl/`.
+2. **Como a Camada Física (Camada 2) Opera no Perfil Híbrido (HTAP + Core ACID PostgreSQL)**:
+   - **PostgreSQL 16 (Containerizado via Docker Compose na porta `5434`)**: Hospeda o schema transacional e fiduciário (`ingestion_idempotency_registry`, `commercial_invoices`, `commercial_invoice_lines`, `accounts`, `journal_entries`, `journal_lines`, `comex_quarantine_hitl`, `customs_nationalizations`) e as tabelas dimensionais e fato (`fact_comex_operations`, `dim_merchandise_ncm`, `dim_partner_country`, `dim_currency_ptax`, `dim_date`).
+   - **PyArrow + DuckDB + Parquet Hive**: Realiza a ingestão em streaming de arquivos massivos do MDIC (blocos configuráveis), grava em **Apache Parquet (Snappy)** particionado no padrão Hive (`year=YYYY/month=MM`) com merge atômico por partição sem perda de dados (`FLOW=IMPORT`/`EXPORT`) e deduplicação por chave natural, além de consultas analíticas OLAP em sub-segundo.
+   - **FastAPI REST Layer (`src/api/main.py`)**: Expõe endpoints determinísticos V2 documentados com OpenAPI/Swagger (`/health`, `/metrics`, `/api/v2/invoices/ingest`, `/api/v2/ledger/reconcile-swift`, `/api/v2/analytics/landed-cost-sim`, `/api/v2/quarantine/pending`, `/api/v2/quarantine/{quarantine_id}/resolve`), autenticados por `X-API-Key` (`API_KEY` / `AUDITOR_API_KEY`), com rate limiting via `slowapi` (`RATE_LIMIT_PER_MINUTE`), `structlog` JSON + `X-Correlation-ID` e tratamento sanitizado de erros (rotas legadas `/api/v1/*` removidas -> HTTP `404`).
 
 ---
 
-## 6. Estrutura de Diretórios Alvo do Repositório (`comex-data-engine-v2`)
+## 6. Estrutura de Diretórios do Repositório (`comex-data-engine-v2`)
 
 ```text
 comex-data-engine-v2/
-├── .agents/
-│   └── mcp_config.json                          # Registro declarativo de servidores MCP
-├── .claude/
-│   ├── CLAUDE.md                                # Shim leve importando @AGENTS.md
-│   └── agents/
-│       ├── planner.md                           # Subagente Architect (Read-Only + ODCS Draft)
-│       ├── worker.md                            # Subagente Developer (Worktree Isolation)
-│       ├── auditor.md                           # Subagente Quality Auditor (PASS / BLOCK)
-│       └── dataops.md                           # Subagente Incident Triage & Self-Healing
-├── .gemini/
-│   └── GEMINI.md                                # Shim leve para Antigravity / Gemini CLI
+├── .env.example                                   # Template de variáveis (PostgreSQL 5434, Mongo 27018 auth, API Keys, PII Salt)
 ├── .github/
 │   └── workflows/
-│       └── ci.yml                               # Pipeline CI: Ruff, Pytest, ODCS Lint & Contract Checks
+│       └── ci.yml                                 # Pipeline CI: Postgres + Mongo healthy, uv sync, Ruff, ODCS lint, Alembic, Seed x2, SQL audit, Pytest (0 skipped)
+├── alembic/
+│   ├── env.py                                     # Ambiente Alembic lendo DATABASE_URL e executando migrations SQL
+│   ├── script.py.mako
+│   └── versions/
+│       └── 0001_initial_schema.py                 # Migração inicial aplicando ddl/01 e ddl/02 em PostgreSQL
 ├── contracts/
-│   └── comex_fiduciary_engine_v2.odcs.yaml      # Contrato Executável ODCS v3.2.0 (Tabelas, Grain, Decimal, SLAs)
+│   └── comex_fiduciary_engine_v2.odcs.yaml        # Contrato Executável ODCS v3.2.0 (Tabelas, Grain, Decimal, SLAs)
 ├── knowledge/
 │   ├── domain/
-│   │   ├── architecture_raw.md                  # Este Relatório Arquitetural (RAW)
-│   │   └── semantic_rules.md                    # Regras pareadas MANDATE / !ANTI_PATTERN
+│   │   ├── architecture_raw.md                    # Este Relatório Arquitetural (RAW)
+│   │   └── semantic_rules.md                      # Regras pareadas MANDATE / !ANTI_PATTERN
 │   └── runbooks/
-│       └── INCIDENT_TEMPLATE.md                 # Árvore de decisão determinística P0-P3
-├── samples/                                     # Seed Data determinístico para execução 100% offline/local
-│   ├── comex_mdic_sample.csv                    # Amostra realista de importação/exportação MDIC
-│   ├── bacen_ptax_sample.json                   # Cotações PTAX multi-moeda (USD, EUR, CHF) com feriados
-│   ├── commercial_invoices_batch.json           # Lote de Invoices (FOB, CIF, válidas e com erro p/ HITL)
-│   └── swift_camt053_statements.json            # Extratos bancários internacionais com tarifas SWIFT
+│       ├── INCIDENT_TEMPLATE.md                   # Árvore de decisão determinística P0-P3
+│       └── INC-2026-11-10-001_quarantine_triage.md # RCA determinístico de quarentena HITL
+├── playgrounds/
+│   └── quickstart_comex.mongodb.js                # Script MongoDB Playground (authSource=admin, porta 27018)
+├── samples/                                       # Seed Data determinístico para execução offline/local
+│   ├── bacen_ptax_sample.json                     # Cotações PTAX multi-moeda (USD, EUR, CHF) com preenchimento LOCF
+│   ├── comex_mdic_sample.csv                      # Amostra agregada de importação/exportação MDIC
+│   ├── commercial_invoices_batch.json             # Lote de Invoices (FOB, CIF, válidas, autocorrigível e com erro p/ HITL)
+│   ├── customs_nationalizations_sample.json       # Declarações DI/Duimp para LUCRO_REAL e CUSTO_INTEGRAL
+│   ├── mdic_exp_sample.csv                        # Microdados brutos MDIC Exportação (multi-CO_UNID)
+│   ├── mdic_imp_sample.csv                        # Microdados brutos MDIC Importação (multi-CO_UNID)
+│   ├── mdic_ncm_sample.csv                        # Amostra de códigos NCM
+│   ├── mdic_pais_sample.csv                       # Amostra de países parceiros MDIC
+│   └── swift_camt053_statements.json              # Extratos ISO 20022 camt.053 com tarifas SWIFT
+├── skills/
+│   ├── grilling-architecture.md                   # Protocolo de entrevista de arquitetura
+│   └── post-incident-learn.md                     # Protocolo de aprendizado pós-incidente
 ├── sql/
 │   ├── ddl/
-│   │   ├── 01_schema_fiduciary_ledger.sql       # Tabelas ACID: invoices, accounts, journal_entries, journal_lines
-│   │   └── 02_schema_comex_star.sql             # Star Schema: fact_comex_operations, dim_ncm, dim_ptax, dim_date
+│   │   ├── 01_schema_fiduciary_ledger.sql         # ACID Ledger, Triggers append-only/zero-sum/HITL e customs_nationalizations
+│   │   └── 02_schema_comex_star.sql               # Star Schema: fact_comex_operations, dim_date, dim_merchandise_ncm, dim_partner_country, dim_currency_ptax
 │   └── queries/
-│       ├── analytical_landed_cost_by_ncm.sql    # Cálculo de Landed Cost, Frete e Seguro por NCM/Modal
-│       └── audit_trial_balance_zero_sum.sql     # Auditoria contábil de soma zero do Razão (General Ledger)
+│       ├── 00_init_duckdb_views.sql               # Registra views DuckDB sobre Parquet Hive
+│       ├── 01_audit_trial_balance_zero_sum.sql    # Auditoria contábil de soma zero do Razão
+│       ├── 02_sabotage_test_append_only_trigger.sql # Prova transacional dos triggers PL/pgSQL
+│       ├── 03_fx_and_swift_reconciliation_audit.sql # Inspeção PTAX LOCF & split SWIFT
+│       ├── 04_analytical_landed_cost_by_ncm.sql   # Análise OLAP de Landed Cost por NCM/Modal
+│       ├── 05_quarantine_hitl_forensics.sql       # Forense da fila comex_quarantine_hitl
+│       ├── 06_brazilian_cascading_taxes_simulation.sql # Validação de tributos em cascata e ICMS por dentro
+│       └── 07_hitl_quarantine_resolution_audit.sql # Auditoria fim-a-fim da resolução HITL
 ├── src/
 │   ├── __init__.py
-│   ├── config.py                                # Configurações tipadas e parâmetros de backoff/tolerância
-│   ├── ingestion/
-│   │   ├── comex_client.py                      # Cliente resiliente MDIC + PyArrow Streaming Parquet Hive
-│   │   ├── bacen_ptax_client.py                 # Cliente Olinda/SGS + Algoritmo LOCF (Forward-Fill)
-│   │   └── agentic_extractor.py                 # Extrator estruturado com Self-Correction Loop (3 tentativas)
-│   ├── validation/
-│   │   └── schemas.py                           # Contratos Pydantic V2 (Zero Float, CNPJ/UID, Incoterms, Balance)
-│   ├── ledger/
-│   │   ├── double_entry.py                      # Motor de Partidas Dobradas Imutável & Reversal Entries
-│   │   └── fx_reconciliation.py                 # Variação Cambial (PTAX t1 vs Spot t2) & Conciliação SWIFT
-│   ├── storage/
-│   │   ├── repository.py                        # Persistência ACID (Idempotência SHA-256, Upsert, Quarentena HITL)
-│   │   └── parquet_lakehouse.py                 # Escrita colunar Snappy Hive & consultas analíticas DuckDB
 │   ├── api/
-│   │   └── app.py                               # Endpoints RESTful determinísticos em FastAPI
-│   └── main.py                                  # Orquestrador CLI (seed, ingest, reconcile, audit, serve)
+│   │   ├── __init__.py
+│   │   └── main.py                                # Gateway FastAPI V2 (X-API-Key, slowapi rate limit, /health, /metrics, V2 routes)
+│   ├── connectors/
+│   │   ├── __init__.py
+│   │   ├── lakehouse.py                           # Escrita colunar Parquet Hive (merge seguro por partição) & DuckDB context manager
+│   │   ├── mongo.py                               # Cliente PyMongo com URI autenticada (porta 27018, authSource=admin)
+│   │   └── postgres.py                            # Engine SQLAlchemy 2.0 + pool para PostgreSQL 16 (porta 5434)
+│   ├── extractors/
+│   │   ├── __init__.py
+│   │   ├── bacen_ptax_client.py                   # Cliente Olinda BACEN + LOCF + fallback offline explícito (offline_fallback=True)
+│   │   ├── http_client.py                         # ResilientAPIExtractor (Tenacity retry apenas transiente, 4xx fail-fast) & SHA-256 hash
+│   │   └── mdic_bulk_loader.py                    # Loader MDIC CSV + pré-agregação 8-chaves + DuckDB PTAX no-lookahead
+│   ├── models/
+│   │   ├── __init__.py
+│   │   ├── _validators.py                         # Guardrails anti-float, NaN/Inf/bool/overflow e validadores compartilhados
+│   │   ├── canonical.py                           # Schema canônico base V2
+│   │   ├── customs.py                             # Ledger DTOs (frozen), SWIFT split, PTAX LOCF, Tax Cascade & CPC 16
+│   │   ├── invoices.py                            # CommercialInvoiceInput (CNPJ Modulo-11, Swiss UID, Incoterms, hash PII)
+│   │   └── quarantine.py                          # QuarantineRecordInput & enum canônico REJECTED_HITL
+│   ├── pipeline/
+│   │   ├── __init__.py
+│   │   └── comex_processor.py                     # ComexHTAPProcessor (Mongo landing, self-correction 3x, ACID Ledger, SWIFT, HITL)
+│   └── seed.py                                    # Orquestrador CLI idempotente (Alembic upgrade head + seed HTAP completo)
 ├── tests/
-│   ├── test_schemas_and_decimal.py              # Testes anti-float, fechamento vertical, CNPJ, UID e NCM
-│   ├── test_idempotency_and_retry.py            # Testes de deduplicação SHA-256, Upsert e Full Jitter + Self-Correction
-│   ├── test_double_entry_ledger.py              # Testes de soma zero, imutabilidade append-only e estornos
-│   ├── test_fx_and_swift_reconciliation.py      # Testes de PTAX LOCF, variação cambial e Split Journal Entry SWIFT
-│   ├── test_fastapi_endpoints.py                # Testes de integração da API REST FastAPI
-│   └── test_contract_odcs_checks.py             # Verificação executável das invariantes SQL do contrato ODCS v3.2.0
-├── AGENTS.md                                    # Governança canônica de runtime (< 150 linhas)
-├── Dockerfile                                   # Imagem Python 3.11-slim otimizada
-├── docker-compose.yml                           # Orquestração PostgreSQL 16 + Comex Engine API/Pipeline
-├── Makefile                                     # Comandos de automação (setup, seed, test, contract-lint, all)
-├── pyproject.toml                               # Dependências gerenciadas via uv
-└── README.md                                    # Documentação executiva e técnica bilíngue / padrão ouro
+│   ├── conftest.py                                # Env + FakeHTAPBackend isolado para suíte unitária
+│   ├── test_canonical_htap.py                     # Testes unitários V2: aposentadoria V1, /health mocked, HTTP retry
+│   ├── test_comex_fiduciary_v2.py                 # Suíte fiduciária principal (Gates Pydantic, PTAX, MDIC, Tax Cascade, API V2, HITL)
+│   ├── test_live_htap.py                          # Testes de integração ao vivo (PG, Mongo, DuckDB, Triggers, API/SWIFT, Seed x2; zero skips)
+│   ├── test_wave1_models_connectors.py            # Testes Wave 1: validadores, overflow, frozen DTOs, lakehouse merge, 4xx fail-fast
+│   └── test_wave2_api_pipeline_seed.py            # Testes Wave 2: auth 401/403, 429 rate-limit, /health 503, /metrics, SWIFT, seed x2
+├── alembic.ini                                    # Configuração Alembic
+├── Dockerfile                                     # Imagem Python 3.12-slim multi-estágio (non-root comex)
+├── docker-compose.yml                             # PostgreSQL 16 (5434) + MongoDB 7 auth (27018) + Comex API (8000)
+├── Makefile                                       # Automação: setup, up, migrate, seed, lint, test, contract-lint, verify, run-api
+├── pyproject.toml                                 # Dependências e configuração Ruff/Pytest gerenciadas via uv
+└── README.md                                      # Documentação executiva e técnica do projeto
 ```
 
 ---
 
-## 7. Especificação Preliminar dos Contratos de Dados (Target Schemas para o `planner`)
+## 7. Especificação dos Contratos de Dados & Schemas Físicos
 
-Para orientar o subagente `data-architecture-planner` na geração do contrato executável `./contracts/comex_fiduciary_engine_v2.odcs.yaml`, o modelo contempla **3 Coleções NoSQL no MongoDB** e **6 Tabelas Nucleares no PostgreSQL**:
+Em conformidade com o contrato executável `./contracts/comex_fiduciary_engine_v2.odcs.yaml`, o modelo contempla **4 Coleções NoSQL no MongoDB** e **13 Tabelas Relacionais no PostgreSQL**:
 
-### 🍃 Coleções NoSQL no MongoDB (Database: `comex_raw_lake`)
-0. **`raw_commercial_invoices` (Landing Zone de Faturas)**:
+### 🍃 Coleções NoSQL no MongoDB (Database: `comex_raw_lake`, Porta `27018`)
+1. **`raw_commercial_invoices` (Landing Zone de Faturas)**:
    - **Grain**: 1 documento por payload recebido de fornecedor/API.
-   - **Campos Principais**: `_id` (ObjectId), `payload_hash` (CHAR 64), `received_at` (ISODate), `raw_payload` (BSON flexível com cabeçalhos e itens originais), `ingestion_status` (`PENDING_VALIDATION`, `NORMALIZED_TO_POSTGRES`, `QUARANTINED`).
-   - **Inspeção Visual**: MongoDB Compass em `mongodb://localhost:27017` -> `comex_raw_lake.raw_commercial_invoices`.
-0. **`raw_swift_statements` (Landing Zone de Mensagens Bancárias)**:
-   - **Grain**: 1 documento por mensagem de extrato internacional (ISO 20022 `camt.053` ou MT103).
-   - **Campos**: `_id`, `end_to_end_id`, `statement_date`, `currency`, `gross_amount`, `deducted_fees`, `net_credited_amount`, `ordering_customer`, `raw_message`.
-0. **`raw_mdic_declarations` (Landing Zone Aduaneira)**:
+   - **Campos Principais**: `_id` (ObjectId), `payload_hash` (CHAR 64), `idempotency_key`, `source_system`, `landed_at` / `received_at` (ISODate), `raw_payload` (BSON com cabeçalhos e itens originais).
+   - **Inspeção Visual**: MongoDB Compass em `mongodb://comex_mongo_user:comex_mongo_pass@localhost:27018/comex_raw_lake?authSource=admin` -> `comex_raw_lake.raw_commercial_invoices`.
+2. **`raw_bacen_ptax` (Landing Zone de Cotações Olinda BACEN)**:
+   - **Grain**: 1 documento por página de resposta OData da API BACEN PTAX.
+3. **`raw_swift_statements` (Landing Zone de Mensagens Bancárias)**:
+   - **Grain**: 1 documento por mensagem/requisição de liquidação internacional (ISO 20022 `camt.053` ou MT103).
+4. **`raw_mdic_declarations` (Landing Zone Aduaneira)**:
    - **Grain**: 1 documento por lote de dados brutos do MDIC/Comex Stat.
 
-### 🐘 Tabelas Relacionais ACID no PostgreSQL 16 (Database: `comex_fiduciary_db`)
-1. **`commercial_invoices` (Camada Fiduciária / Operacional)**:
-   - **Grain**: 1 linha por fatura comercial internacional validada (`invoice_id` UUID / chave natural composta `issuer_tax_id + document_number + issue_date + currency_code + total_amount`).
+### 🐘 Tabelas Relacionais ACID no PostgreSQL 16 (Database: `comex_fiduciary_db`, Porta `5434`)
+1. **`commercial_invoices` & `commercial_invoice_lines` (Camada Fiduciária / Operacional)**:
+   - **Grain**: 1 linha por fatura comercial internacional validada (`invoice_id` UUID / chave natural composta `issuer_tax_id + document_number + issue_date + currency_code + total_amount`) e `1:N` itens em `commercial_invoice_lines`.
    - **Rastreabilidade NoSQL**: Coluna `mongo_raw_id` apontando para o ObjectId de origem no MongoDB.
-   - **Medidas Estritas (`DECIMAL(19,4)` & `BIGINT` cents)**: `subtotal_amount`, `tax_amount`, `freight_amount`, `insurance_amount`, `total_amount`, `landed_cost_brl`.
-   - **Invariante SQL**: `ABS(total_amount - (subtotal_amount + tax_amount + freight_amount + insurance_amount)) <= 0.0001`.
+   - **Medidas Estritas (`NUMERIC(19,4)` & `BIGINT GENERATED ALWAYS` cents)**: `subtotal_amount`, `tax_amount`, `freight_amount`, `insurance_amount`, `total_amount` (+ `*_cents` geradas automaticamente no banco).
+   - **Invariante SQL**: `ABS(total_amount - (subtotal_amount + tax_amount + freight_amount + insurance_amount)) <= 0.0001` e `chk_invoice_cif_freight_insurance` exigindo `freight_amount > 0` e `insurance_amount > 0` para `CIF`.
 2. **`journal_entries` & `journal_lines` (Camada Contábil — Append-Only Double-Entry Ledger)**:
    - **Grain**: 1 cabeçalho por fato contábil (`entry_id`) e $N \ge 2$ linhas de partida dobrada (`line_id`).
-   - **Invariante SQL de Soma Zero**: `SELECT COUNT(*) FROM (SELECT entry_id FROM journal_lines GROUP BY entry_id HAVING ABS(SUM(debit_amount) - SUM(credit_amount)) > 0.0001)` deve ser estritamente `0`.
-   - **Invariante de Não-Negatividade**: `debit_amount >= 0` e `credit_amount >= 0`, sendo proibido uma mesma linha ter débito e crédito simultaneamente maiores que zero.
+   - **Invariante SQL de Soma Zero**: Trigger diferida `fn_enforce_double_entry_zero_sum()` garante que toda entrada `POSTED`/`REVERSED` tenha $\ge 2$ linhas e `ABS(SUM(debit_amount) - SUM(credit_amount)) <= 0.0001`.
+   - **Invariante de Imutabilidade**: Triggers `fn_enforce_append_only_ledger()` bloqueiam `UPDATE`/`DELETE`/`TRUNCATE` em `journal_lines` e mutações destrutivas em `journal_entries`.
 3. **`fact_comex_operations` (Camada Analítica Star Schema)**:
-   - **Grain**: 1 linha por agregação mensal de declaração aduaneira (`operation_hash_id`).
+   - **Grain**: 1 linha por agregação mensal de declaração aduaneira (`operation_hash_id = SHA-256(ano|mes|tipo_op|co_ncm|co_pais|sg_uf|co_via|co_urf)`).
    - **Dimensões Conformadas**: `date_id` (`dim_date`), `ncm_code` (`dim_merchandise_ncm`), `country_code` (`dim_partner_country`), `uf_code`, `modal_code`.
-   - **Medidas**: `fob_amount_usd` (`DECIMAL(19,4)`), `freight_amount_usd` (`DECIMAL(19,4)`), `insurance_amount_usd` (`DECIMAL(19,4)`), `cif_amount_usd` (`DECIMAL(19,4)`), `landed_cost_brl` (`DECIMAL(19,4)`), `net_weight_kg` (`DECIMAL(19,4)`), `statistical_quantity` (`DECIMAL(19,4)`).
+   - **Medidas**: `fob_amount_usd` (`NUMERIC(19,4)`), `freight_amount_usd` (`NUMERIC(19,4)`), `insurance_amount_usd` (`NUMERIC(19,4)`), `cif_amount_usd` (`NUMERIC(19,4)`), `landed_cost_brl` (`NUMERIC(19,4)`), `net_weight_kg` (`NUMERIC(19,4)`), `statistical_quantity` (`NUMERIC(19,4)`).
 4. **`dim_currency_ptax` (Dimensão de Séries Cambiais Diárias)**:
    - **Grain**: 1 linha por `(date_id, currency_code)`.
-   - **Atributos**: `ptax_buy_rate` (`DECIMAL(19,6)`), `ptax_sell_rate` (`DECIMAL(19,6)`), `is_business_day` (`BOOLEAN`), `is_interpolated_locf` (`BOOLEAN`).
-5. **`comex_quarantine_hitl` (Dead-Letter Queue & Human-in-the-Loop)**:
-   - **Grain**: 1 linha por tentativa de ingestão barrada na borda (`quarantine_id`).
-   - **Atributos**: `raw_payload_hash`, `mongo_raw_id`, `source_type` (`INVOICE`, `MDIC_BATCH`, `SWIFT_STATEMENT`), `validation_errors_json`, `self_correction_attempts` (`INT`), `review_status` (`PENDING_REVIEW`, `APPROVED_OVERRIDE`, `REJECTED`), `created_at`.
+   - **Atributos**: `ptax_buy_rate` (`NUMERIC(19,6)`), `ptax_sell_rate` (`NUMERIC(19,6)`), `is_business_day` (`BOOLEAN`), `is_interpolated_locf` (`BOOLEAN`).
+   - **Consulta Sem Lookahead**: Resoluções PTAX consultam sempre `date_id <= target_date_id ORDER BY date_id DESC LIMIT 1`.
+5. **`comex_quarantine_hitl` & `ingestion_idempotency_registry` (DLQ & Human-in-the-Loop)**:
+   - **Grain**: 1 linha por tentativa de ingestão barrada na borda (`quarantine_id`) + registro de idempotência (`payload_hash`).
+   - **Atributos**: `raw_payload_hash`, `mongo_raw_id`, `source_type` (`INVOICE`, `MDIC_BATCH`, `SWIFT_STATEMENT`), `validation_errors`, `self_correction_attempts` (`INT`), `review_status` (`PENDING_REVIEW`, `APPROVED_OVERRIDE`, `REJECTED_HITL`), `reviewed_by`, `reviewed_at`, `created_at`.
+6. **`customs_nationalizations` (Motor Tributário em Cascata & CPC 16)**:
+   - **Grain**: 1 linha por DI/DUIMP liquidada (`nationalization_id` UUID / `declaration_number`), registrando impostos (`II`, `IPI`, `PIS`, `COFINS`, `Siscomex`, `AFRMM`, `ICMS` por dentro), `net_inventory_cost_brl` e `recoverable_taxes_brl` conforme regime tributário (`LUCRO_REAL` vs `LUCRO_PRESUMIDO` / `SIMPLES_NACIONAL` / `CUSTO_INTEGRAL`).
 
 ---
 
@@ -380,10 +403,9 @@ Para orientar o subagente `data-architecture-planner` na geração do contrato e
 
 ---
 
-## 9. Próximo Passo Imediato (Kickoff do Subagente `planner`)
+## 9. Governança Contínua e Checklist de Verificação
 
-Com este **Relatório de Arquitetura de Dados (RAW)** consolidado e gravado em `./knowledge/domain/architecture_raw.md`, o próximo passo no fluxo **80/90/90** consiste em acionar o subagente **`data-architecture-planner`** para:
-1. Executar o *Pre-Flight Architectural Fitness Gate*.
-2. Gerar o contrato executável completo `./contracts/comex_fiduciary_engine_v2.odcs.yaml`.
-3. Codificar as regras pareadas `MANDATE:` e `!ANTI_PATTERN:` em `./knowledge/domain/semantic_rules.md`.
-4. Apresentar a Tabela de Auto-Auditoria de 5 Pontos antes de liberar a implementação para o subagente `worker`.
+Antes de promover alterações de schema, contratos ou pipelines em `comex-data-engine-v2`:
+1. Executar `make contract-lint` (`uv run datacontract lint ./contracts/*.odcs.yaml`).
+2. Aplicar migrações com `uv run alembic upgrade head` e validar idempotência de seed (`make seed` x2).
+3. Validar código, queries SQL (`sql/queries/00..07*.sql`) e suíte completa via `uv run ruff check .` e `uv run pytest tests/ -v` (zero skips).

@@ -1,52 +1,33 @@
 ---
 name: grilling-architecture
-description: Structured pre-code technical interview protocol to eliminate ambiguities in grain, ODCS v3.2.0 contracts, PII governance, SLAs, and financial reconciliation before implementation.
-version: 1.0.0
-owner: data-architecture-team
-invoked_by: ["data-architecture-planner", "main-orchestrator"]
-audit_trail: git-pr
+description: Structured architectural interview protocol (Grill-Me) to align grain, fiduciary math, HTAP schemas, and ODCS v3.2.0 contracts before modifying pipelines or DDL.
 ---
 
-# Skill: Grilling Architecture Interview (`grilling-architecture.md`)
+# Architectural Alignment Protocol ("Grill-Me")
 
-This skill defines the architectural alignment protocol ("Grill-Me") executed by the main orchestrator or the `planner` subagent whenever a pipeline request contains semantic or technical gaps.
+## Purpose
+This skill defines the deterministic design review protocol ("Grill-Me") executed before implementing new ingestion pipelines, schema migrations, or analytical marts whenever requirements contain semantic or technical gaps.
 
-- **MANDATE**: Walk down the decision tree resolving one dependency at a time, always providing a **recommended option (`(Recommended)`)** grounded in `./knowledge/domain/semantic_rules.md` and the `datahub` catalog.
-- **!ANTI_PATTERN**: Never dump a 10-question questionnaire all at once or guess financial/tax rules by inference when they are not documented in `./knowledge/`.
+## Core Rule
+- **MANDATE**: Walk down the decision tree resolving one dependency at a time, always providing a **recommended option (`(Recommended)`)** grounded in `./knowledge/domain/semantic_rules.md`, `./knowledge/domain/architecture_raw.md`, and `./contracts/comex_fiduciary_engine_v2.odcs.yaml`.
+- **!ANTI_PATTERN**: Never guess missing financial grain, rounding behavior, tax regime semantics, or storage layout without clarifying them explicitly against the contract and DDL.
 
----
+## Phase 1: Context Discovery (Mandatory Pre-Flight)
+Before posing questions, silently inspect:
+1. Domain rules in `./knowledge/domain/semantic_rules.md` and physical schemas in `./sql/ddl/` + `./alembic/versions/`.
+2. Executable data contract `./contracts/comex_fiduciary_engine_v2.odcs.yaml` (`ODCS v3.2.0`).
+3. Existing Pydantic V2 validators in `./src/models/` (`Decimal` quantization, Modulo-11 CNPJ, corporate tax IDs, `QuarantineRecordInput` states).
 
-## Step 1 — Silent Pre-Inspection (Zero-Redundancy Check)
-Before asking the human engineer any question, strictly execute:
-1. Local search via `rg` across `./knowledge/domain/semantic_rules.md` and `./contracts/*.odcs.yaml` to check if the rule is already specified.
-2. Live metadata lookup via `datahub` MCP to inspect existing schemas, primary keys, and lineage for referenced tables.
-3. **Golden Rule**: If the answer already exists in the codebase, ODCS contract, or MCP catalog, **do not ask the user** — use the verified evidence directly.
+## Phase 2: Sequential Architectural Decision Tree
 
-## Step 2 — Interview Decision Tree (5 Critical Branches)
-Walk through the branches below sequentially (one question per turn) only for dimensions that remain unresolved after Step 1:
+### 1. Granularity & Natural Keys
+- **Key Question**: What is the exact atomic grain of the target entity (e.g., 1 row per `invoice_id` / `line_id`, 1 row per ledger `entry_id`, or 1 row per `(ano|mes|tipo_op|co_ncm|co_pais|sg_uf|co_via|co_urf)` SHA-256 `operation_hash_id`), and how are replays idempotently deduplicated?
+- **Default Recommendation**: `(Recommended)` Preserve triple idempotency: MongoDB `payload_hash`/`idempotency_key` landing (`comex_raw_lake` on port `27018`), PostgreSQL `ingestion_idempotency_registry` + natural key `UNIQUE` constraints (port `5434`), and Parquet Hive deduplication on natural keys.
 
-### Branch A: Target Grain & Primary Identity
-- **Key Question**: What is the exact atomic grain of the target table (e.g., 1 row per `order_id`, 1 row per `order_item_id`, or daily summary by `order_date`), and how should duplicate or late-arriving CDC events be handled?
-- **Default Recommendation**: Propose deterministic deduplication via `ROW_NUMBER() OVER (PARTITION BY <pk> ORDER BY <updated_at> DESC) = 1` with the natural key documented in the ODCS contract.
+### 2. Monetary Precision & Fiduciary Invariants
+- **Key Question**: For monetary amounts and FX rates, are strict `Decimal("0.0001")` (`NUMERIC(19,4)` + `*_cents` BIGINT) and `Decimal("0.000001")` (`NUMERIC(19,6)`) enforced via `parse_strict_decimal`, rejecting IEEE 754 `float`, `bool`, `NaN`/`Infinity`, and `None`?
+- **Default Recommendation**: `(Recommended)` Reject all `float` inputs with Pydantic V2 `ValidationError` -> deflect persistent mismatches (> `0.0001`) to `comex_quarantine_hitl` (`PENDING_REVIEW` -> `APPROVED_OVERRIDE` | `REJECTED_HITL`), and require zero-sum (`SUM(debit) - SUM(credit) == 0.0000`) on `journal_entries` / `journal_lines`.
 
-### Branch B: JOIN Cardinality & Fan-Out Prevention
-- **Key Question**: When joining the anchor entity with auxiliary tables, what is the expected cardinality (`1:1`, `N:1`, `1:N`) and what pre-aggregation rule must be applied to `1:N` child tables?
-- **Default Recommendation**: Propose explicit pre-aggregating CTEs grouped by the join key prior to the main `LEFT JOIN`.
-
-### Branch C: Financial Semantics & Domain Rules
-- **Key Question**: For `measure` columns (`DECIMAL(18,4)`), which transaction statuses qualify for official metric recognition, and how should `NULL` values or partial refunds be handled?
-- **Default Recommendation**: Propose strict adherence to the canonical accounting identity in `./knowledge/domain/semantic_rules.md` with `COALESCE(val, 0.0000)`.
-
-### Branch D: PII Classification & Security
-- **Key Question**: Are there any new columns containing Personally Identifiable Information (tax ID, email, phone, IP address) requiring salted `SHA-256` hashing or partial masking from Bronze $\rightarrow$ Silver?
-- **Default Recommendation**: Propose salted `SHA-256` hashing and `classification: confidential | restricted` metadata in the ODCS contract.
-
-### Branch E: Incremental Strategy, Partitioning & SLA
-- **Key Question**: Which column defines physical partitioning in Apache Iceberg, what is the lookback window for late-arriving facts, and what is the maximum acceptable freshness SLA?
-- **Default Recommendation**: Propose `incremental_strategy='merge'` partitioned by the accounting date (`order_date`) with a 3-day lookback window and automated Elementary monitors.
-
-## Step 3 — Consolidation & Auditable Materialization via Git PR
-Once all branches are resolved:
-1. Update (or generate) `./contracts/<asset>_<layer>_v<version>.odcs.yaml` reflecting every decision.
-2. If a new reusable domain rule was established, append it to `./knowledge/domain/semantic_rules.md` using the paired `MANDATE:` / `!ANTI_PATTERN:` syntax.
-3. Hand off the signed blueprint for implementation by the `worker` subagent.
+### 3. Temporal Semantics, Storage Partitioning & Governance
+- **Key Question**: Which date column governs Hive partitioning in `./data/parquet_lakehouse` (`year=YYYY/month=MM`) for DuckDB queries, how is zero-lookahead PTAX (`date_id <= target_date_id`) preserved, and how do Alembic migrations stay aligned with `sql/ddl/`?
+- **Default Recommendation**: `(Recommended)` Partition fact tables in Parquet Hive by competence/statistical `year`/`month` (`DECIMAL(19,4)` PyArrow schemas), apply LOCF forward-fill only (`date_id <= target_date_id`), sync schema via `uv run alembic upgrade head`, and certify with `make contract-lint`, `uv run ruff check .`, and `uv run pytest tests/ -v`.

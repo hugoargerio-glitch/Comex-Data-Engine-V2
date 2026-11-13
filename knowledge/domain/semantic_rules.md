@@ -10,7 +10,7 @@ last_verified: "2026-11-09"
 
 # Canonical Domain Semantic Rules — Comex Resilient Data & Fiduciary Engine V2 (`semantic_rules.md`)
 
-This **Open Knowledge Format (OKF)** document defines the institutional single source of truth for international trade (COMEX), foreign exchange (FX) reconciliation, double-entry fiduciary accounting, and data governance in `comex-data-engine-v2`. Every subagent (`planner`, `worker`, `auditor`, `dataops`) must consult and strictly adhere to these paired constraints before designing, implementing, or auditing pipelines.
+This **Open Knowledge Format (OKF)** document defines the institutional single source of truth for international trade (COMEX), foreign exchange (FX) reconciliation, double-entry fiduciary accounting, and data governance in `comex-data-engine-v2`. Every pipeline module, API handler, and contributor must strictly adhere to these paired constraints before designing, implementing, or auditing workloads.
 
 ---
 
@@ -19,17 +19,21 @@ This **Open Knowledge Format (OKF)** document defines the institutional single s
 | Entity / Collection / Table | Storage Engine | Layer | Atomic Grain | Primary Key / Natural Key | Partition Key | Invariant / Cardinality |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | `raw_commercial_invoices` | MongoDB 7 | Landing | 1 BSON doc per incoming invoice payload | `_id` (ObjectId) / `payload_hash` | N/A | Append-only raw landing zone |
-| `raw_swift_statements` | MongoDB 7 | Landing | 1 BSON doc per bank statement message | `_id` (ObjectId) / `end_to_end_id` | N/A | ISO 20022 `camt.053` or MT103 |
+| `raw_bacen_ptax` | MongoDB 7 | Landing | 1 BSON doc per BACEN Olinda API page | `_id` (ObjectId) / `idempotency_key` | N/A | Raw Olinda OData responses |
+| `raw_swift_statements` | MongoDB 7 | Landing | 1 BSON doc per bank statement message | `_id` (ObjectId) / `idempotency_key` | N/A | ISO 20022 `camt.053` or MT103 |
 | `raw_mdic_declarations` | MongoDB 7 | Landing | 1 BSON doc per raw MDIC declaration batch | `_id` (ObjectId) / `batch_id` | N/A | Raw customs batch metadata |
-| `commercial_invoices` | PostgreSQL 16 | Operational Core | **1 row per validated commercial invoice** | `invoice_id` (UUID) / Composite Natural Key | `issue_date` | `1:N` to `journal_entries` |
+| `ingestion_idempotency_registry` | PostgreSQL 16 | Edge Governance | 1 row per ingested payload fingerprint | `payload_hash` (SHA-256) | N/A | Edge dedup & `REJECTED_HITL` guard |
+| `commercial_invoices` | PostgreSQL 16 | Operational Core | **1 row per validated commercial invoice** | `invoice_id` (UUID) / Composite Natural Key | `issue_date` | `1:N` to `journal_entries` & lines; `*_cents` `GENERATED ALWAYS` |
+| `commercial_invoice_lines` | PostgreSQL 16 | Operational Core | 1 row per itemized invoice product line | `line_id` (UUID) / `(invoice_id, line_number)` | N/A | `quantity * unit_price == total_price` |
 | `accounts` | PostgreSQL 16 | Operational Core | 1 row per Chart of Accounts code | `account_code` | N/A | Master Chart of Accounts |
-| `journal_entries` | PostgreSQL 16 | Fiduciary Ledger | 1 row per accounting transaction event | `entry_id` (UUID) | `competence_date` | `1:N` to `journal_lines` ($N \ge 2$) |
+| `journal_entries` | PostgreSQL 16 | Fiduciary Ledger | 1 row per accounting transaction event | `entry_id` (UUID) | `competence_date` | `1:N` to `journal_lines` ($N \ge 2$); append-only |
 | `journal_lines` | PostgreSQL 16 | Fiduciary Ledger | 1 row per debit or credit entry leg | `line_id` (UUID) | N/A | $\sum \text{Debit} - \sum \text{Credit} = 0$ |
-| `comex_quarantine_hitl` | PostgreSQL 16 | Operational DLQ | 1 row per rejected ingestion payload | `quarantine_id` (UUID) | N/A | `PENDING_REVIEW` queue |
+| `comex_quarantine_hitl` | PostgreSQL 16 | Operational DLQ | 1 row per rejected ingestion payload | `quarantine_id` (UUID) | N/A | `PENDING_REVIEW` -> `APPROVED_OVERRIDE` \| `REJECTED_HITL` |
+| `customs_nationalizations` | PostgreSQL 16 | Operational Core | 1 row per DI / Duimp tax liquidation | `nationalization_id` (UUID) / `declaration_number` | `clearance_date` | Cascading taxes + ICMS por dentro |
 | `dim_date` | DuckDB / PG | Analytical Dim | 1 row per calendar day | `date_id` (YYYYMMDD) | N/A | Canonical calendar |
 | `dim_merchandise_ncm` | DuckDB / PG | Analytical Dim | 1 row per 8-digit NCM code | `ncm_code` (8 digits) | N/A | Conforms to HS 6-digit prefix |
 | `dim_partner_country` | DuckDB / PG | Analytical Dim | 1 row per trading partner country | `country_code` (MDIC ID) | N/A | Conforms to ISO 3166-1 alpha-3 |
-| `dim_currency_ptax` | DuckDB / PG | Analytical Dim | 1 row per `(date_id, currency_code)` | `(date_id, currency_code)` | N/A | 365 days LOCF forward-filled |
+| `dim_currency_ptax` | DuckDB / PG | Analytical Dim | 1 row per `(date_id, currency_code)` | `(date_id, currency_code)` | `year=YYYY/month=MM` | LOCF forward-filled (`date_id <= target`) |
 | `fact_comex_operations` | Parquet Hive / DuckDB | Analytical Fact | 1 row per monthly customs declaration cell | `operation_hash_id` (SHA-256) | `year=YYYY/month=MM` | `1:1` per statistical cell |
 
 ### Paired Granularity & Fan-Out Prevention Constraints (Comex)
@@ -110,7 +114,7 @@ This **Open Knowledge Format (OKF)** document defines the institutional single s
 ## 8. Shift-Left Quarantine & Agentic Self-Correction Loop
 
 ### Paired Error Handling & HITL Constraints
-- **MANDATE**: On Pydantic V2 `ValidationError` during document extraction, run at most 3 **Agentic Self-Correction Loop** iterations reinjecting `err.errors()`; if still invalid, route the payload to `comex_quarantine_hitl` (`status = 'PENDING_REVIEW'`) preserving `mongo_raw_id` for visual inspection in MongoDB Compass.
+- **MANDATE**: On Pydantic V2 `ValidationError` during document extraction, run at most 3 deterministic **Self-Correction Loop** iterations; if still invalid, route the payload to `comex_quarantine_hitl` (`review_status = 'PENDING_REVIEW'`) preserving `mongo_raw_id` for visual inspection in MongoDB Compass.
 - **!ANTI_PATTERN**: Never perform blind LLM retries with the identical prompt, and never silently drop or coerce arithmetic mismatches into production tables.
 - **MANDATE**: All arithmetic mismatches exceeding $0.0001$ (`ABS(total - (subtotal + tax + freight + insurance)) > 0.0001`) must fail validation immediately and be quarantined for human auditor review via MongoDB Compass.
 - **!ANTI_PATTERN**: Never coerce or silently round arithmetic discrepancies into an arbitrary balancing line without human review.
@@ -120,13 +124,13 @@ This **Open Knowledge Format (OKF)** document defines the institutional single s
 ## 9. Bulk MDIC Comex Stat Ingestion & Dimensional Integrity
 
 ### Paired Bulk Ingestion & Referential Integrity Constraints
-- **MANDATE**: When processing raw MDIC microdata (`IMP_YYYY.csv` / `EXP_YYYY.csv`), stream-parse and pre-aggregate records sharing the identical canonical 8-attribute natural tuple `(ano, mes, tipo_op, co_ncm, co_pais, sg_uf, co_via, co_urf)`, summing `statistical_quantity`, `net_weight_kg`, `fob_amount_usd`, `freight_amount_usd`, and `insurance_amount_usd` across different measurement units (`CO_UNID`) using strict `Decimal("0.0001")` (`ROUND_HALF_UP`) prior to calculating `operation_hash_id`.
+- **MANDATE**: When processing raw MDIC microdata (`IMP_YYYY.csv` / `EXP_YYYY.csv`), stream-parse and pre-aggregate records sharing the identical canonical 8-attribute natural tuple `(ano, mes, tipo_op, co_ncm, co_pais, sg_uf, co_via, co_urf)`, summing `statistical_quantity`, `net_weight_kg`, `fob_amount_usd`, `freight_amount_usd`, and `insurance_amount_usd` across different measurement units (`CO_UNID`) using strict `Decimal("0.0001")` (`ROUND_HALF_UP`) prior to calculating delimiter-safe `operation_hash_id = SHA-256(ano|mes|tipo_op|co_ncm|co_pais|sg_uf|co_via|co_urf)`.
 - **!ANTI_PATTERN**: Never insert un-aggregated raw MDIC rows with identical 8-key attributes into `fact_comex_operations`, as differing `CO_UNID` lines will trigger primary key collisions on `operation_hash_id` or cause non-deterministic upsert overwrites.
 - **MANDATE**: Prior to persisting batches into `fact_comex_operations`, defensively ensure dimensional referential integrity via Early-Arriving Dimensions auto-upsert (`INSERT INTO dim_date ... ON CONFLICT (date_id) DO NOTHING`, `INSERT INTO dim_merchandise_ncm ... ON CONFLICT (ncm_code) DO NOTHING`, and `INSERT INTO dim_partner_country ... ON CONFLICT (country_code) DO NOTHING`) to guarantee zero foreign key constraint violations during asynchronous bulk ingestion.
 - **!ANTI_PATTERN**: Never execute blind batch inserts into fact tables without verifying that parent foreign keys exist in `dim_date`, `dim_merchandise_ncm`, and `dim_partner_country`, which leads to pipeline halting and hard foreign key rollbacks.
 - **MANDATE**: For export microdata declarations (`EXP_YYYY.csv`) where MDIC does not publish international freight and insurance (`VL_FRETE`, `VL_SEGURO`), default both amounts strictly to `Decimal("0.0000")` and set `cif_amount_usd = fob_amount_usd` to satisfy customs valuation consistency.
 - **!ANTI_PATTERN**: Never impute non-zero or arbitrary estimates for export freight and insurance, and never leave `cif_amount_usd` null or lower than `fob_amount_usd`.
-- **MANDATE**: Automatically value the internalized inventory cost `landed_cost_brl` by multiplying `cif_amount_usd` by the monthly statistical USD selling rate (`ptax_sell_rate` for `date_id = YYYYMM01`) obtained from `dim_currency_ptax` (falling back to the lakehouse or statutory default), rounded to `Decimal("0.0001")` using `ROUND_HALF_UP`.
+- **MANDATE**: Automatically value the internalized inventory cost `landed_cost_brl` by multiplying `cif_amount_usd` by the latest USD selling rate on or before the statistical reference month (`WHERE currency_code = 'USD' AND date_id <= target_date_id ORDER BY date_id DESC LIMIT 1`) obtained from PostgreSQL `dim_currency_ptax` or DuckDB Parquet (falling back to the statutory default only when no prior observation exists, never looking ahead into future dates), rounded to `Decimal("0.0001")` using `ROUND_HALF_UP`.
 - **!ANTI_PATTERN**: Never persist unvalued or zero-valued `landed_cost_brl` for valid import customs transactions, and never use float arithmetic to compute BRL landed cost from USD CIF.
 
 ---
@@ -159,13 +163,15 @@ This **Open Knowledge Format (OKF)** document defines the institutional single s
 ## 11. Closed-Loop HITL Quarantine Governance & Promotion Invariants
 
 ### Paired HITL Quarantine Resolution & Promotion Constraints
-- **MANDATE**: Enforce a strict finite state machine for the Human-in-the-Loop quarantine queue (`comex_quarantine_hitl`): an item enters as `PENDING_REVIEW` and transitions monotonically to either `APPROVED_OVERRIDE` or `REJECTED`. Once finalized (`review_status != 'PENDING_REVIEW'`), the review decision is strictly immutable; any subsequent modification or re-resolution attempt must be rejected with an immediate conflict exception (`HTTP 409 Conflict` / `ValueError`).
+- **MANDATE**: Enforce a strict finite state machine for the Human-in-the-Loop quarantine queue (`comex_quarantine_hitl`): an item enters as `PENDING_REVIEW` and transitions monotonically to either `APPROVED_OVERRIDE` or `REJECTED_HITL`. Once finalized (`review_status != 'PENDING_REVIEW'`), the review decision is strictly immutable via both application validation and PostgreSQL trigger `trg_enforce_quarantine_hitl_immutability`; any subsequent modification or re-resolution attempt must be rejected with an immediate conflict exception (`HTTP 409 Conflict` / `ValueError`).
 - **!ANTI_PATTERN**: Never permit re-opening, modifying, or re-resolving an already finalized quarantine record in place, which violates the statutory customs audit trail and breaks deterministic downstream ledger reconciliation.
 - **MANDATE**: When resolving an invoice quarantine record via `APPROVED_OVERRIDE`, the reviewer must provide a corrected payload that strictly passes `CommercialInvoiceInput` contract validation (including the Anti-Float rule, B2B corporate tax ID verification, Incoterm explicit separation, horizontal line math, and vertical closure within $\pm 0.0001$). If validation fails, the transaction must abort immediately without altering the `PENDING_REVIEW` quarantine state.
 - **!ANTI_PATTERN**: Never promote or force-commit an unvalidated or mathematically broken payload into `commercial_invoices` during human override, and never bypass Pydantic V2 shift-left contract guards under the guise of manual review.
 - **MANDATE**: Execute invoice quarantine promotion within an atomic ACID transaction that simultaneously: (1) upserts the corrected invoice into `commercial_invoices`, (2) generates and posts the balanced double-entry accounting entry into `journal_entries` and `journal_lines` ($\sum \text{Debit} - \sum \text{Credit} = 0.0000$), (3) updates `comex_quarantine_hitl` with `review_status = 'APPROVED_OVERRIDE'`, non-empty auditor identity (`reviewed_by`), and UTC timestamp (`reviewed_at`), and (4) updates `ingestion_idempotency_registry` to `status = 'RESOLVED_OVERRIDE'` for both the original rejected hash and the corrected payload hash.
 - **!ANTI_PATTERN**: Never write partial promotion state where an invoice is inserted into `commercial_invoices` without corresponding balanced double-entry ledger lines, or where the quarantine status is updated without updating the edge idempotency registry.
-- **MANDATE**: When resolving an invoice quarantine record via `REJECTED`, update `comex_quarantine_hitl` with `review_status = 'REJECTED'`, mandatory non-empty auditor ID (`reviewed_by`), and UTC timestamp (`reviewed_at`), while recording `status = 'REJECTED_HITL'` in `ingestion_idempotency_registry` to prevent duplicate ingestion re-attempts.
-- **!ANTI_PATTERN**: Never silently drop or leave rejected records without auditor attribution, and never permit unrecorded rejected payload hashes to repeatedly enter the ingestion pipeline.
+- **MANDATE**: When resolving an invoice quarantine record via `REJECTED_HITL`, update `comex_quarantine_hitl` with `review_status = 'REJECTED_HITL'`, mandatory non-empty auditor ID (`reviewed_by`, hashed via salted SHA-256 with `PII_HASH_SALT` before persistence), and UTC timestamp (`reviewed_at`), while recording `status = 'REJECTED_HITL'` in `ingestion_idempotency_registry` to reject duplicate ingestion re-attempts with HTTP `409 Conflict`.
+- **!ANTI_PATTERN**: Never silently drop or leave rejected records without auditor attribution, never persist raw unhashed auditor email/name PII in `reviewed_by`, and never permit unrecorded rejected payload hashes to repeatedly enter the ingestion pipeline.
+- **MANDATE**: Protect all operational V2 API endpoints with fail-closed `X-API-Key` authentication (`API_KEY` for standard ingest/read; `AUDITOR_API_KEY` for privileged `POST /api/v2/quarantine/{id}/resolve` and `?persist=true` nationalizations) and dynamic per-IP rate limiting (`RATE_LIMIT_PER_MINUTE`), returning sanitized JSON errors without raw tracebacks or database credentials.
+- **!ANTI_PATTERN**: Never expose mutating or quarantine endpoints without `X-API-Key` authorization checks, and never serialize Python stack traces, Mongo URIs, or PostgreSQL DSNs in API error payloads or `/health` responses.
 
 

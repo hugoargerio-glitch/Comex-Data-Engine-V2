@@ -1,33 +1,41 @@
-// ====================================================================
-// 🚢 PLAYGROUND COMEX DATA ENGINE V2 - RAW LANDING ZONE (MongoDB 7)
-// Conexão: mongodb://localhost:27018 ou mongodb://localhost:27017
-// Dica: Abra este arquivo no VS Code e clique no ícone "▶ Run" no topo direito!
-// ====================================================================
+// Comex Resilient Data & Fiduciary Engine V2 — MongoDB 7 Playground (VS Code / mongosh)
+// Authenticated Connection String (MongoDB Compass / mongosh):
+// mongodb://comex_mongo_user:comex_mongo_pass@localhost:27018/comex_raw_lake?authSource=admin
 
-// 1. Seleciona o banco da Raw Landing Zone do Comex V2
-use('comex_raw_lake');
+use("comex_raw_lake");
 
-// 2. Estatísticas das Coleções Brutas
-const colecoes = db.getCollectionNames();
+// 1. Listar coleções e contagens na Raw Landing Zone (Bronze)
+const collections = [
+  "raw_commercial_invoices",
+  "raw_bacen_ptax",
+  "raw_swift_statements",
+  "raw_mdic_declarations",
+];
 
-// 3. Inspeção das Faturas Comerciais Brutas
-const totalInvoices = db.raw_commercial_invoices.countDocuments();
-const faturasAmostra = db.raw_commercial_invoices.find(
-  {},
-  { payload_hash: 1, ingested_at: 1, "raw_payload.document_number": 1, "raw_payload.total_amount": 1, "raw_payload.currency_code": 1 }
-).sort({ ingested_at: -1 }).limit(5).toArray();
-
-// 4. Forense: Buscar documento bruto a partir de um mongo_raw_id obtido na Quarentena do DBeaver!
-// (Substitua a string abaixo por um mongo_raw_id de comex_quarantine_hitl para inspecionar o JSON original)
-const exemploRawId = db.raw_commercial_invoices.findOne({}, { _id: 1 });
-const documentoForense = exemploRawId ? db.raw_commercial_invoices.findOne({ _id: exemploRawId._id }) : null;
-
-// 5. Painel de Retorno Exibido no VS Code
-({
-  status: "✅ Raw Lake MongoDB Conectado!",
-  database: "comex_raw_lake",
-  colecoes_existentes: colecoes,
-  total_invoices_brutas: totalInvoices,
-  amostra_invoices: faturasAmostra,
-  documento_inspecionado: documentoForense
+collections.forEach((colName) => {
+  const count = db.getCollection(colName).countDocuments({});
+  print(`${colName}: ${count} BSON document(s)`);
 });
+
+// 2. Verificar índices únicos de idempotência
+collections.forEach((colName) => {
+  print(`--- Indexes on ${colName} ---`);
+  printjson(db.getCollection(colName).getIndexes());
+});
+
+// 3. Inspecionar as 5 últimas Commercial Invoices brutas recebidas pela API / Pipeline
+db.getCollection("raw_commercial_invoices")
+  .find({}, { _id: 1, idempotency_key: 1, payload_hash: 1, source_system: 1, landed_at: 1 })
+  .sort({ landed_at: -1 })
+  .limit(5);
+
+// 4. Inspecionar extratos SWIFT e cotações BACEN Olinda PTAX aterrissadas
+db.getCollection("raw_swift_statements")
+  .find({})
+  .sort({ landed_at: -1 })
+  .limit(5);
+
+db.getCollection("raw_bacen_ptax")
+  .find({}, { _id: 1, endpoint: 1, payload_hash: 1, landed_at: 1 })
+  .sort({ landed_at: -1 })
+  .limit(5);

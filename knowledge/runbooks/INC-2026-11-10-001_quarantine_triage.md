@@ -51,7 +51,7 @@ flowchart TD
     C1 -->|INV-2026-ERR-CIF| S3B["Step 3B: Incoterm CIF Zero Freight/Insurance Breach"]
     S3A --> S4["Step 4: Blast Radius Calculation (Tax Overpayment & Valuation Distortions)"]
     S3B --> S4
-    S4 --> S5A["Step 5A: INV-2026-ERR-MATH -> PENDING_REVIEW / REJECTED (Credit Note Required)"]
+    S4 --> S5A["Step 5A: INV-2026-ERR-MATH -> PENDING_REVIEW / REJECTED_HITL (Credit Note Required)"]
     S4 --> S5B["Step 5B: INV-2026-ERR-CIF -> APPROVED_OVERRIDE (Auditor Verified B/L)"]
     S5A --> S6["Step 6: RCA (5 Whys) & Immunization via post-incident-learn.md"]
     S5B --> S6
@@ -92,7 +92,7 @@ Telemetry from Pydantic V2 extraction validators and contract assertions classif
 
 ### Step 3 — Category-Specific Diagnostic Queries & Results
 
-The `dataops` subagent executed diagnostic inspection on PostgreSQL 16:
+Fiduciary triage diagnostics executed directly against PostgreSQL 16 (port `5434`):
 
 #### Diagnostic Query 1: Quarantined Ingestion Payloads in `comex_quarantine_hitl`
 ```sql
@@ -159,7 +159,7 @@ HAVING COUNT(*) > 1;
 
 ### Step 4 — Blast Radius Assessment & Financial Exposure
 
-Using DataHub MCP column-level lineage and Comex domain formulas (`semantic_rules.md` Section 10), the theoretical blast radius had these records entered production uncontained was quantified:
+Using SQL lineage audit queries (`sql/queries/01..07*.sql`) and Comex domain formulas (`semantic_rules.md` Section 10), the theoretical blast radius had these records entered production uncontained was quantified:
 
 ```
 [raw_commercial_invoices] (MongoDB)
@@ -195,18 +195,18 @@ Using DataHub MCP column-level lineage and Comex domain formulas (`semantic_rule
 
 ### Step 5 — Deterministic Containment & Triage Verdicts
 
-The `dataops` subagent, in coordination with the fiduciary audit gate (`hugo.auditor@comex.br`), executed deterministic containment actions:
+The engineering triage team, in coordination with the fiduciary audit gate (`hugo.auditor@comex.br`), executed deterministic containment actions:
 
 #### Verdict 1 — `INV-2026-ERR-MATH`:
-- **Triage Decision**: **Keep in `PENDING_REVIEW` / mark `REJECTED`** pending formal foreign exporter rectification.
+- **Triage Decision**: **Keep in `PENDING_REVIEW` / mark `REJECTED_HITL`** pending formal foreign exporter rectification.
 - **Auditor Rationale**:
   - The $9,000.00 discrepancy is an inherent vendor arithmetic error on the issued commercial invoice.
   - In strict compliance with `semantic_rules.md` (Mandate 8 & 11) and ODCS v3.2.0 contract rules, the agentic pipeline **strictly prohibited autonomous total coercion or line-item fabrication**.
   - Commercial and legal teams were alerted to request a revised invoice or an official Credit Note (*Nota de Crédito Internacional*) from the exporter (`Petróleo Brasileiro S.A. / Vendor Partner`).
-- **Audit Ledger Mutation in PostgreSQL**:
+- **Audit Ledger Mutation in PostgreSQL** (enforced via `POST /api/v2/quarantine/{quarantine_id}/resolve` with `AUDITOR_API_KEY` or atomic SQL transition from `PENDING_REVIEW` before `trg_enforce_quarantine_hitl_immutability` locks final state):
   ```sql
   UPDATE comex_quarantine_hitl
-  SET review_status = 'REJECTED',
+  SET review_status = 'REJECTED_HITL',
       reviewed_by = 'hugo.auditor@comex.br',
       reviewed_at = '2026-11-10T11:45:10Z'
   WHERE raw_payload_hash = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
@@ -227,16 +227,14 @@ The `dataops` subagent, in coordination with the fiduciary audit gate (`hugo.aud
       reviewed_at = '2026-11-10T11:55:40Z'
   WHERE raw_payload_hash = '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945';
 
-  -- Promoted payload into transactional operational ledger
+  -- Promoted payload into transactional operational ledger (*_cents columns are PostgreSQL GENERATED ALWAYS columns)
   INSERT INTO commercial_invoices (
       invoice_id, issuer_tax_id, document_number, issue_date, currency_code,
       subtotal_amount, tax_amount, freight_amount, insurance_amount, total_amount,
-      subtotal_amount_cents, tax_amount_cents, freight_amount_cents, insurance_amount_cents, total_amount_cents,
       incoterm, extraction_confidence, raw_payload_hash, mongo_raw_id, created_at, updated_at
   ) VALUES (
       'a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d', 'CHE-116.281.710 MWST', 'INV-2026-ERR-CIF', '2026-11-09', 'CHF',
       85000.0000, 0.0000, 3500.0000, 500.0000, 89000.0000,
-      850000000, 0, 35000000, 5000000, 890000000,
       'CIF', 1.0000, '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945',
       '6730a91fbc8e4120a149b002', NOW(), NOW()
   );
@@ -310,13 +308,13 @@ The following contract assertions and instructions in `./contracts/comex_fiducia
 | Quarantine Routing | `comex_quarantine_hitl` | PostgreSQL 16 | Records routed = 2 | **PASS** |
 | Shift-Left Protection | `commercial_invoices` | PostgreSQL 16 | Corrupted rows = 0 | **PASS** |
 | CIF Override Promotion | `commercial_invoices` | PostgreSQL 16 | `INV-2026-ERR-CIF` posted with $89k total | **PASS** |
-| Exporter Rejection Hold | `comex_quarantine_hitl` | PostgreSQL 16 | `INV-2026-ERR-MATH` status `REJECTED` | **PASS** |
+| Exporter Rejection Hold | `comex_quarantine_hitl` | PostgreSQL 16 | `INV-2026-ERR-MATH` status `REJECTED_HITL` | **PASS** |
 
 ---
 
 ## 4. Audit Sign-off
 
-- **DataOps Reliability Lead**: Principal DataOps & Reliability Engineer (`dataops`)
+- **DataOps Reliability Lead**: Principal DataOps & Reliability Engineer
 - **Fiduciary Auditor**: Hugo Auditor (`hugo.auditor@comex.br`)
 - **Action Status**: Completed & Verified
 - **Git Audit Trail**: Ready for PR inclusion under Sprint Real 4 incident closure.
