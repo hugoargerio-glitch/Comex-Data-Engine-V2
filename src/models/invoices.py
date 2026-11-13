@@ -54,7 +54,7 @@ def validate_cnpj(cnpj: str) -> bool:
 
     # First verification digit
     w1 = [5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]
-    s1 = sum(d * w for d, w in zip(digits[:12], w1))
+    s1 = sum(d * w for d, w in zip(digits[:12], w1, strict=True))
     r1 = s1 % 11
     d1 = 0 if r1 < 2 else 11 - r1
     if digits[12] != d1:
@@ -62,7 +62,7 @@ def validate_cnpj(cnpj: str) -> bool:
 
     # Second verification digit
     w2 = [6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]
-    s2 = sum(d * w for d, w in zip(digits[:13], w2))
+    s2 = sum(d * w for d, w in zip(digits[:13], w2, strict=True))
     r2 = s2 % 11
     d2 = 0 if r2 < 2 else 11 - r2
     return digits[13] == d2
