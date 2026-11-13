@@ -123,6 +123,10 @@ BEGIN
         END IF;
     END;
 
+    -- Descarregar eventos pendentes das constraint triggers antes de testar TRUNCATE
+    SET CONSTRAINTS trg_check_journal_entry_balance, trg_check_journal_lines_balance IMMEDIATE;
+    SET CONSTRAINTS trg_check_journal_entry_balance, trg_check_journal_lines_balance DEFERRED;
+
     -- 7. Sabotagem G: Bloqueio de TRUNCATE em journal_lines e journal_entries
     BEGIN
         TRUNCATE TABLE journal_lines;
