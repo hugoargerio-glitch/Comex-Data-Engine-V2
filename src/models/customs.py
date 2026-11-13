@@ -485,6 +485,8 @@ class JournalLineInput(BaseModel):
             )
         if not is_debit and not is_credit:
             raise ValueError("Ledger line must have either debit > 0 or credit > 0.")
+        if self.original_currency_amount <= Decimal("0.0000"):
+            raise ValueError("original_currency_amount must be strictly positive (> 0.0000).")
         return self
 
 
