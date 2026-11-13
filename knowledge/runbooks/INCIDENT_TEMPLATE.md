@@ -12,10 +12,10 @@ last_verified: "2026-11-10"
 
 # Deterministic Incident Response Runbook (`INCIDENT_TEMPLATE.md`)
 
-This runbook defines the mandatory deterministic protocol for the `dataops` subagent during ingestion failures, ODCS v3.2.0 data contract breaches (`urn:datacontract:comex:fiduciary_engine_v2`), double-entry balance violations, or anomalies detected across the **Comex Resilient Data & Fiduciary Engine V2 (Profile 2 Hybrid HTAP Medallion)**.
+This runbook defines the mandatory deterministic protocol for data engineering & fiduciary audit responders during ingestion failures, ODCS v3.2.0 data contract breaches (`urn:datacontract:comex:fiduciary_engine_v2`), double-entry balance violations, or anomalies detected across the **Comex Resilient Data & Fiduciary Engine V2 (Hybrid HTAP Medallion)**.
 
 - **MANDATE**: Execute the 6 steps of the Deterministic Decision Tree below sequentially before invoking open-ended generative reasoning.
-- **!ANTI_PATTERN**: Never run destructive re-executions, overwrite posted ledger entries in PostgreSQL (`UPDATE`/`DELETE` on `journal_lines`), or mutate Iceberg/DuckDB analytical tables without completing Steps 1 through 4 and verifying the Severity Matrix.
+- **!ANTI_PATTERN**: Never run destructive re-executions, overwrite posted ledger entries in PostgreSQL (`UPDATE`/`DELETE` on `journal_lines`), or mutate Parquet Hive / DuckDB analytical partitions without completing Steps 1 through 4 and verifying the Severity Matrix.
 
 ---
 
@@ -24,8 +24,8 @@ This runbook defines the mandatory deterministic protocol for the `dataops` suba
 | Severity | Classification Criteria | Triage SLA | Autonomous Action Allowed (`ALWAYS DO`) | Human Gate (`ASK FIRST`) |
 | :--- | :--- | :--- | :--- | :--- |
 | **P0 (Critical)** | Silent corruption in `journal_entries` / `journal_lines` (double-entry zero-sum invariant violation: $\sum \text{Debit} \neq \sum \text{Credit}$); cleartext natural-person PII leak; corrupted cascading tax or customs valuation in `customs_nationalizations` (distorting statutory ICMS "cálculo por dentro" or duties); fan-out multiplying `landed_cost_brl` in `fact_comex_operations`. | < 15 min | Pause downstream ingestion DAG; trigger DLQ isolation into `comex_quarantine_hitl`; isolate offending batch; identify last clean transactional checkpoint / snapshot. | Production double-entry reversal (`create_reversal_entry`); DuckDB partition rollback; external statutory auditor or Receita Federal notification. |
-| **P1 (High)** | Hard-block failure in `datacontract test`, Pydantic V2 validation, or DuckDB build halting `commercial_invoices` or `customs_nationalizations` updates beyond 1h freshness SLA. Deflection of arithmetic mismatches (> 0.0001) to `comex_quarantine_hitl` without auto-resolution. | < 30 min | Collect Elementary MCP telemetry; query quarantine state; compute blast radius in DataHub MCP; draft hotfix PR in an isolated git worktree. | Emergency ODCS v3.2.0 contract modification or manual approval override (`APPROVED_OVERRIDE`) of quarantined records. |
-| **P2 (Medium)** | Volume or distribution anomaly in Elementary (`edr`) or MDIC microdata ingestion (`fact_comex_operations`), PTAX currency LOCF gap > 3 business days in `dim_currency_ptax`, or transient delay in non-critical analytical dimensions. | < 4 hours | Inspect upstream Landing/Bronze statistical drift; open detailed RCA diagnostic with recommended threshold/logic adjustment. | Modifying anomaly detection sensitivity thresholds in Elementary or contract rules. |
+| **P1 (High)** | Hard-block failure in `datacontract lint`, Pydantic V2 validation, or DuckDB build halting `commercial_invoices` or `customs_nationalizations` updates beyond 1h freshness SLA. Deflection of arithmetic mismatches (> 0.0001) to `comex_quarantine_hitl` without auto-resolution. | < 30 min | Inspect `/health`, `/metrics`, and FastAPI structured logs; query quarantine state in PostgreSQL 16 (port `5434`); compute blast radius via `sql/queries/01..07*.sql`; draft hotfix PR in an isolated git worktree. | Emergency ODCS v3.2.0 contract modification or manual approval override (`APPROVED_OVERRIDE`) of quarantined records. |
+| **P2 (Medium)** | Volume or distribution anomaly in DuckDB/Parquet analytics or MDIC microdata ingestion (`fact_comex_operations`), PTAX currency LOCF gap > 3 business days in `dim_currency_ptax`, or transient delay in non-critical analytical dimensions. | < 4 hours | Inspect upstream Landing/Bronze BSON payloads in MongoDB 7 (port `27018`); open detailed RCA diagnostic with recommended threshold/logic adjustment. | Modifying PTAX/MDIC validation thresholds or contract rules. |
 | **P3 (Low)** | Deprecation warnings, schema comment drift, transient network jitter below SLA breach thresholds, or dev/staging synthetic discrepancies. | < 24 hours | Log diagnostic summary and propose preventive refactoring via standard PR. | N/A |
 
 ---
@@ -39,7 +39,7 @@ flowchart TD
     C1 -->|Schema Drift / Contract Break| S3A["Step 3A: Inspect Landing Diff vs comex_fiduciary_engine_v2"]
     C1 -->|Data Integrity / Financial Reconciliation| S3B["Step 3B: Isolate Quarantined Payloads & Test Zero-Sum Invariant"]
     C1 -->|Freshness / Volume Anomaly| S3C["Step 3C: Check PTAX LOCF & MDIC Pipeline Latency"]
-    S3A --> S4["Step 4: Blast Radius Calculation (DataHub + HTAP Lineage)"]
+    S3A --> S4["Step 4: Blast Radius Calculation (SQL Audit Queries + HTAP Lineage)"]
     S3B --> S4
     S3C --> S4
     S4 --> S5["Step 5: Deterministic Containment (Quarantine Routing / Split Entries)"]
@@ -48,14 +48,14 @@ flowchart TD
 
 ### Step 1 — Alert Ingestion & Scope Verification
 1. Identify the exact failing asset:
-   - **Operational Ledger / Core (PostgreSQL 16)**: `commercial_invoices`, `journal_entries`, `journal_lines`, `customs_nationalizations`, `comex_quarantine_hitl`.
-   - **Raw Landing Zone (MongoDB 7)**: `raw_commercial_invoices`, `raw_swift_statements`, `raw_mdic_declarations`.
-   - **Analytical Lakehouse (Parquet / DuckDB)**: `fact_comex_operations`, `dim_currency_ptax`, `dim_merchandise_ncm`, `dim_partner_country`.
+   - **Operational Ledger / Core (PostgreSQL 16, port `5434`)**: `commercial_invoices`, `commercial_invoice_lines`, `journal_entries`, `journal_lines`, `customs_nationalizations`, `comex_quarantine_hitl`, `ingestion_idempotency_registry`.
+   - **Raw Landing Zone (MongoDB 7, port `27018`, authSource `admin`)**: `raw_commercial_invoices`, `raw_bacen_ptax`, `raw_swift_statements`, `raw_mdic_declarations`.
+   - **Analytical Lakehouse (Parquet Hive / DuckDB)**: `fact_comex_operations`, `dim_currency_ptax`, `dim_merchandise_ncm`, `dim_partner_country`.
 2. Identify the contract reference: `urn:datacontract:comex:fiduciary_engine_v2` (`version: 2.0.0`).
 3. Assign initial severity (`P0` through `P3`) using the Comex Severity Matrix above.
 
-### Step 2 — Deterministic Failure Classification via MCP Telemetry
-Inspect telemetry from `postgres` query tool, `elementary-observability`, and contract validation logs:
+### Step 2 — Deterministic Failure Classification via Database & Contract Telemetry
+Inspect telemetry from PostgreSQL 16 (`sql/queries/01..07*.sql`), FastAPI `/health` & `/metrics`, and `make contract-lint` / `pytest` logs:
 - **Case A (Schema / Contract Drift)**: Missing column, incompatible physical type (e.g., IEEE 754 float introduced instead of `NUMERIC(19,4)`), unannounced enum value (`currency_code` not in USD/EUR/CHF/BRL, invalid Incoterm, unrecognized `tax_regime`), or masked corporate tax ID.
 - **Case B (Data Integrity / Financial Reconciliation)**:
   - Vertical closure discrepancy: `subtotal_amount + tax_amount + freight_amount + insurance_amount != total_amount` (tolerance > 0.0001).
@@ -129,7 +129,7 @@ Run the following Read-Only diagnostic queries to isolate discrepancies:
    ```
 2. Check upstream ingestion latency in MongoDB landing collections (`raw_commercial_invoices`, `raw_mdic_declarations`).
 
-### Step 4 — Blast Radius Calculation (DataHub MCP + HTAP Lineage)
+### Step 4 — Blast Radius Calculation (PostgreSQL Audit Queries + HTAP Lineage)
 1. Trace dependency lineage from the affected table/column across HTAP layers:
    - **Landing**: `raw_commercial_invoices` (MongoDB)
    - **Operational Core**: `commercial_invoices` (PostgreSQL)
@@ -144,7 +144,7 @@ Run the following Read-Only diagnostic queries to isolate discrepancies:
   - Route malformed or mathematically inconsistent records immediately to `comex_quarantine_hitl` with `review_status = 'PENDING_REVIEW'`, preserving `mongo_raw_id` for visual auditing via MongoDB Compass.
   - Allow valid invoices in the batch to proceed seamlessly into `commercial_invoices` and downstream posting.
 - **If arithmetic discrepancy cannot be resolved deterministically**:
-  - **MANDATE**: Autonomous agents must NEVER hallucinate or force-balance financial totals. Keep the record in `PENDING_REVIEW` or mark `REJECTED`, alerting the foreign exporter to supply a formal credit note or corrected invoice.
+  - **MANDATE**: Autonomous agents must NEVER hallucinate or force-balance financial totals. Keep the record in `PENDING_REVIEW` or mark `REJECTED_HITL`, alerting the foreign exporter to supply a formal credit note or corrected invoice.
 - **If Incoterm CIF is missing freight/insurance breakdown on invoice face**:
   - Human auditor inspects the attached Bill of Lading (B/L) and Insurance Certificate via MongoDB Compass. Upon verifying external logistics figures, the auditor submits an `APPROVED_OVERRIDE` recording `reviewed_by` and updating the itemized breakdown.
 - **If systemic posted ledger corruption (P0)**:
@@ -162,7 +162,7 @@ Run the following Read-Only diagnostic queries to isolate discrepancies:
 ## Incident Report: [INC-YYYY-MM-DD-XXX] — <Short Title>
 - **Severity**: P0 | P1 | P2 | P3
 - **Affected Contract / Asset**: `urn:datacontract:comex:fiduciary_engine_v2` / `<table_or_collection_name>`
-- **Detection Source**: Pydantic V2 / DataContract CLI / PostgreSQL Invariant / Elementary MCP
+- **Detection Source**: Pydantic V2 / DataContract Lint / PostgreSQL Trigger / FastAPI Structured Logs & `/metrics`
 - **Time Window (UTC)**: Start `YYYY-MM-DDTHH:MM:SSZ` — Resolved `YYYY-MM-DDTHH:MM:SSZ`
 - **Downstream Blast Radius**: [List impacted tables: journal_entries, customs_nationalizations, fact_comex_operations, Gold Dashboards]
 
@@ -186,7 +186,7 @@ Run the following Read-Only diagnostic queries to isolate discrepancies:
 
 ### Remediation & Permanent Guardrail Added
 - **Containment Action Taken**: ...
-- **Quarantine Lifecycle Action**: `APPROVED_OVERRIDE` | `REJECTED` | `PENDING_REVIEW`
+- **Quarantine Lifecycle Action**: `APPROVED_OVERRIDE` | `REJECTED_HITL` | `PENDING_REVIEW`
 - **Contract / Test Update (`./contracts/`)**: ...
 - **Knowledge / Runbook Update (`./knowledge/`)**: ...
 - **Audit Verification Hash**: ...

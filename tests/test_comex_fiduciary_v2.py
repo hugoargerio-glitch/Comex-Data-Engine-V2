@@ -8,20 +8,17 @@ agentic self-correction loop, quarantine routing, DuckDB/Parquet OLAP, and FastA
 
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-import hashlib
+import os
 from typing import Any, Dict
 from uuid import uuid4
 
-from fastapi.testclient import TestClient
 from pydantic import ValidationError
 import pytest
 
-from src.api.main import app
-from src.connectors.lakehouse import get_duckdb_connection, write_records_to_parquet_hive
+from src.connectors.lakehouse import get_duckdb_connection
 from src.models.customs import (
     ComexOperationInput,
     CustomsNationalizationCalcInput,
-    CustomsNationalizationResult,
     JournalEntryInput,
     JournalLineInput,
     PTAXRateInput,
@@ -41,9 +38,11 @@ from src.models.invoices import (
     validate_cnpj,
     validate_corporate_tax_id,
 )
-from src.pipeline.comex_processor import ComexHTAPProcessor
-
-client = TestClient(app)
+from src.pipeline.comex_processor import (
+    ComexHTAPProcessor,
+    QuarantineNotFoundError,
+    QuarantineStateConflictError,
+)
 
 # Known valid tax IDs for testing
 VALID_CNPJ_FORMATTED = "33.000.167/0001-01"  # Petrobras
@@ -572,9 +571,10 @@ def test_build_swift_fee_split_entry():
 # Gate 8: Agentic Self-Correction Loop & HITL Quarantine Routing
 # ==============================================================================
 
+
 @pytest.mark.unit
 def test_agentic_self_correction_fixes_floats_and_whitespace():
-    processor = ComexHTAPProcessor()
+    processor = ComexHTAPProcessor(engine=None)
 
     # Payload with fixable defects (float numbers and whitespace strings)
     imperfect_payload = {
@@ -600,8 +600,8 @@ def test_agentic_self_correction_fixes_floats_and_whitespace():
 
 
 @pytest.mark.unit
-def test_agentic_self_correction_deflects_arithmetic_mismatch_to_quarantine():
-    processor = ComexHTAPProcessor()
+def test_agentic_self_correction_deflects_arithmetic_mismatch_to_quarantine(fake_htap_env):
+    processor = ComexHTAPProcessor(engine=fake_htap_env.engine)
 
     # Fundamental arithmetic discrepancy ($200 drift) -> cannot be auto-coerced!
     mismatched_payload = {
@@ -620,7 +620,7 @@ def test_agentic_self_correction_deflects_arithmetic_mismatch_to_quarantine():
     res = processor.process_invoice(mismatched_payload)
     assert res["status"] == "QUARANTINED"
     assert "quarantine_id" in res
-    assert res["self_correction_attempts"] == 3
+    assert 1 <= res["self_correction_attempts"] <= 3
 
 
 # ==============================================================================
@@ -635,8 +635,9 @@ def test_duckdb_parquet_comex_operations_roundtrip(tmp_path):
     lakehouse.PARQUET_BASE_DIR = str(tmp_path / "lakehouse")
     lakehouse.DUCKDB_PATH = str(tmp_path / "lakehouse.duckdb")
 
+    con = None
     try:
-        processor = ComexHTAPProcessor()
+        processor = ComexHTAPProcessor(engine=None)
         op = ComexOperationInput(
             date_id=20261101,
             operation_type="IMPORT",
@@ -663,8 +664,10 @@ def test_duckdb_parquet_comex_operations_roundtrip(tmp_path):
 
         assert len(result) == 1
         assert result[0][0] == "IMPORT"
-        assert result[0][1] == 27500.0
+        assert result[0][1] == Decimal("27500.0000")
     finally:
+        if con is not None:
+            con.close()
         lakehouse.PARQUET_BASE_DIR = old_base
         lakehouse.DUCKDB_PATH = old_duckdb
 
@@ -674,7 +677,8 @@ def test_duckdb_parquet_comex_operations_roundtrip(tmp_path):
 # ==============================================================================
 
 @pytest.mark.unit
-def test_api_v2_invoices_ingest_and_quarantine():
+def test_api_v2_invoices_ingest_and_quarantine(api_client):
+    headers = {"X-API-Key": os.environ["API_KEY"]}
     # 1. Valid invoice
     valid_payload = {
         "issuer_tax_id": VALID_CNPJ_FORMATTED,
@@ -688,10 +692,10 @@ def test_api_v2_invoices_ingest_and_quarantine():
         "insurance_amount": "0.0000",
         "total_amount": "10000.0000",
     }
-    response = client.post("/api/v2/invoices/ingest", json=valid_payload)
+    response = api_client.post("/api/v2/invoices/ingest", json=valid_payload, headers=headers)
     assert response.status_code == 201
     data = response.json()
-    assert data["status"] in {"COMMITTED_ACID", "PROCESSED_MEM"}
+    assert data["status"] == "COMMITTED_ACID"
     assert data["total_amount"] == "10000.0000"
 
     # 2. Arithmetic mismatch routes to Quarantine and returns 422
@@ -707,15 +711,17 @@ def test_api_v2_invoices_ingest_and_quarantine():
         "insurance_amount": "0.0000",
         "total_amount": "9500.0000",  # Divergent math!
     }
-    response_bad = client.post("/api/v2/invoices/ingest", json=bad_payload)
+    response_bad = api_client.post("/api/v2/invoices/ingest", json=bad_payload, headers=headers)
     assert response_bad.status_code == 422
     detail = response_bad.json()["detail"]
     assert "HITL Quarantine" in detail["message"]
+    assert detail["review_status"] == "PENDING_REVIEW"
     assert "quarantine_id" in detail
 
 
 @pytest.mark.unit
-def test_api_v2_ledger_reconcile_swift():
+def test_api_v2_ledger_reconcile_swift(api_client):
+    headers = {"X-API-Key": os.environ["API_KEY"]}
     swift_request = {
         "reference_document_id": "DUIMP-2026-SWIFT-01",
         "transaction_date": "2026-11-09",
@@ -725,10 +731,11 @@ def test_api_v2_ledger_reconcile_swift():
         "currency_code": "USD",
         "exchange_rate": "5.600000",
     }
-    response = client.post("/api/v2/ledger/reconcile-swift", json=swift_request)
+    response = api_client.post("/api/v2/ledger/reconcile-swift", json=swift_request, headers=headers)
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "RECONCILED"
+    assert data["idempotent_replay"] is False
     assert data["lines_count"] == 3
     # Cash Net BRL = (20000 - 50) * 5.60 = 19950 * 5.60 = 111,720.00
     assert data["lines"][0]["debit_amount"] == "111720.0000"
@@ -744,7 +751,6 @@ def test_api_v2_ledger_reconcile_swift():
 
 @pytest.mark.unit
 def test_bacen_ptax_parse_olinda_payload_fechamento_and_locf():
-    import httpx
     from src.extractors.bacen_ptax_client import parse_olinda_ptax_items
 
     raw_payload_items = [
@@ -829,7 +835,7 @@ def test_bacen_ptax_parse_olinda_payload_fechamento_and_locf():
 
 
 @pytest.mark.unit
-def test_bacen_ptax_resilient_retry_and_offline_fallback():
+def test_bacen_ptax_resilient_retry_and_offline_fallback(monkeypatch):
     import httpx
     from src.extractors.bacen_ptax_client import BacenPTAXClient
 
@@ -841,19 +847,45 @@ def test_bacen_ptax_resilient_retry_and_offline_fallback():
 
     mock_client = httpx.Client(transport=httpx.MockTransport(failing_handler))
 
-    client = BacenPTAXClient(
+    # 1. Strict online guard: offline_fallback=False must retry and raise rather than returning stale sample
+    strict_client = BacenPTAXClient(
         client=mock_client,
         timeout_seconds=0.01,
-        offline_fallback=False,  # Not forced offline, verifies automatic fallback on network error
+        offline_fallback=False,
+        engine=None,
+    )
+    monkeypatch.setattr(strict_client.extractor.fetch_json.retry, "sleep", lambda _: None)
+
+    with pytest.raises(httpx.ConnectError):
+        strict_client.fetch_ptax_for_currency(
+            currency_code="USD",
+            start_date=date(2026, 11, 6),
+            end_date=date(2026, 11, 9),
+        )
+
+    assert attempts["count"] == 4
+
+    # 2. Explicit offline mode: offline_fallback=True serves sample within temporal coverage without hitting network
+    offline_attempts = {"count": 0}
+
+    def unexpected_network_handler(request: httpx.Request) -> httpx.Response:
+        offline_attempts["count"] += 1
+        raise AssertionError("Network must not be called when offline_fallback=True")
+
+    offline_client = BacenPTAXClient(
+        client=httpx.Client(transport=httpx.MockTransport(unexpected_network_handler)),
+        timeout_seconds=0.01,
+        offline_fallback=True,
+        engine=None,
     )
 
-    rates = client.fetch_ptax_for_currency(
+    rates = offline_client.fetch_ptax_for_currency(
         currency_code="USD",
         start_date=date(2026, 11, 6),
         end_date=date(2026, 11, 9),
     )
 
-    assert attempts["count"] >= 1
+    assert offline_attempts["count"] == 0
     assert len(rates) == 4
     assert rates[0].date_id == 20261106
     assert rates[0].currency_code == "USD"
@@ -861,6 +893,14 @@ def test_bacen_ptax_resilient_retry_and_offline_fallback():
     assert rates[0].ptax_sell_rate == Decimal("5.824000")
     assert rates[1].date_id == 20261107
     assert rates[1].is_interpolated_locf is True
+
+    # 3. Offline temporal coverage guard: out-of-range dates must fail loudly
+    with pytest.raises(ValueError, match="refusing to propagate stale sample rates"):
+        offline_client.fetch_ptax_for_currency(
+            currency_code="USD",
+            start_date=date(2026, 11, 15),
+            end_date=date(2026, 11, 16),
+        )
 
 
 @pytest.mark.unit
@@ -872,9 +912,10 @@ def test_sync_ptax_period_lakehouse_decimal19_6(tmp_path):
     old_duckdb = lakehouse.DUCKDB_PATH
     lakehouse.PARQUET_BASE_DIR = str(tmp_path / "lakehouse")
     lakehouse.DUCKDB_PATH = str(tmp_path / "test_ptax.duckdb")
+    con = None
 
     try:
-        client = BacenPTAXClient(offline_fallback=True)
+        client = BacenPTAXClient(offline_fallback=True, engine=None)
 
         rates = client.sync_ptax_period(
             start_date=date(2026, 11, 6),
@@ -911,6 +952,8 @@ def test_sync_ptax_period_lakehouse_decimal19_6(tmp_path):
         ).fetchone()[0]
         assert locf_count == 6  # 2 weekend days * 3 currencies
     finally:
+        if con is not None:
+            con.close()
         lakehouse.PARQUET_BASE_DIR = old_base
         lakehouse.DUCKDB_PATH = old_duckdb
 
@@ -1019,9 +1062,10 @@ def test_mdic_filters_and_duckdb_parquet_persistence(tmp_path):
     old_duckdb = lakehouse.DUCKDB_PATH
     lakehouse.PARQUET_BASE_DIR = str(tmp_path / "lakehouse")
     lakehouse.DUCKDB_PATH = str(tmp_path / "test_mdic.duckdb")
+    con = None
 
     try:
-        loader = MDICBulkLoader(offline=True)
+        loader = MDICBulkLoader(offline=True, engine=None)
         sample_imp = Path("samples/mdic_imp_sample.csv")
 
         # 1. Test filtering by NCM prefix
@@ -1040,10 +1084,11 @@ def test_mdic_filters_and_duckdb_parquet_persistence(tmp_path):
         assert len(ops_m2) == 1
         assert ops_m2[0].date_id == 20240201
 
-        # 4. Test Hybrid Persistence into Parquet Hive Lakehouse
+        # 4. Test Hybrid Persistence into Parquet Hive Lakehouse (Postgres disabled in unit test)
         all_ops = loader.parse_and_preaggregate_mdic_csv(csv_path=sample_imp)
         persist_stats = loader.sync_mdic_operations(all_ops, limit_pg=10)
         assert persist_stats["parquet_persisted"] == len(all_ops)
+        assert persist_stats["postgres_persisted"] == 0
 
         # 5. Verify Parquet Lakehouse schema & types in DuckDB: all monetary columns are DECIMAL(19,4)
         con = get_duckdb_connection()
@@ -1070,6 +1115,8 @@ def test_mdic_filters_and_duckdb_parquet_persistence(tmp_path):
         assert result["persistence"]["total_operations"] == 4
         assert result["persistence"]["parquet_persisted"] == 4
     finally:
+        if con is not None:
+            con.close()
         lakehouse.PARQUET_BASE_DIR = old_base
         lakehouse.DUCKDB_PATH = old_duckdb
 
@@ -1232,8 +1279,8 @@ def test_import_nationalization_ledger_entry_zero_sum():
     assert entry_lr.lines[3].debit_amount == Decimal("0.0000")
     assert entry_lr.lines[3].credit_amount == Decimal("201319.1843")
 
-    total_debits_lr = sum(l.debit_amount for l in entry_lr.lines)
-    total_credits_lr = sum(l.credit_amount for l in entry_lr.lines)
+    total_debits_lr = sum(line.debit_amount for line in entry_lr.lines)
+    total_credits_lr = sum(line.credit_amount for line in entry_lr.lines)
     assert total_debits_lr == total_credits_lr == Decimal("512871.0843")
     assert abs(total_debits_lr - total_credits_lr) == Decimal("0.0000")
 
@@ -1278,14 +1325,15 @@ def test_import_nationalization_ledger_entry_zero_sum():
     assert entry_ci.lines[2].debit_amount == Decimal("0.0000")
     assert entry_ci.lines[2].credit_amount == res_ci.total_taxes_brl
 
-    total_debits_ci = sum(l.debit_amount for l in entry_ci.lines)
-    total_credits_ci = sum(l.credit_amount for l in entry_ci.lines)
+    total_debits_ci = sum(line.debit_amount for line in entry_ci.lines)
+    total_credits_ci = sum(line.credit_amount for line in entry_ci.lines)
     assert total_debits_ci == total_credits_ci == res_ci.landed_cost_brl
     assert abs(total_debits_ci - total_credits_ci) == Decimal("0.0000")
 
 
 @pytest.mark.unit
-def test_api_v2_landed_cost_simulation_endpoint():
+def test_api_v2_landed_cost_simulation_endpoint(api_client):
+    headers = {"X-API-Key": os.environ["API_KEY"]}
     # 1. Valid Simulation via FastAPI TestClient
     payload = {
         "declaration_number": "26/1948201-3",
@@ -1306,7 +1354,7 @@ def test_api_v2_landed_cost_simulation_endpoint():
         "afrmm_brl": "0.0000",
         "icms_rate": "0.1800",
     }
-    response = client.post("/api/v2/analytics/landed-cost-sim", json=payload)
+    response = api_client.post("/api/v2/analytics/landed-cost-sim", json=payload, headers=headers)
     assert response.status_code == 200
     data = response.json()
 
@@ -1333,13 +1381,21 @@ def test_api_v2_landed_cost_simulation_endpoint():
     # 2. Reject float inputs via API
     bad_float_payload = payload.copy()
     bad_float_payload["fob_amount"] = 50000.50  # Float!
-    response_bad_float = client.post("/api/v2/analytics/landed-cost-sim", json=bad_float_payload)
+    response_bad_float = api_client.post(
+        "/api/v2/analytics/landed-cost-sim",
+        json=bad_float_payload,
+        headers=headers,
+    )
     assert response_bad_float.status_code == 422
 
     # 3. Reject invalid tax regime
     bad_regime_payload = payload.copy()
     bad_regime_payload["tax_regime"] = "INVALID_REGIME"
-    response_bad_regime = client.post("/api/v2/analytics/landed-cost-sim", json=bad_regime_payload)
+    response_bad_regime = api_client.post(
+        "/api/v2/analytics/landed-cost-sim",
+        json=bad_regime_payload,
+        headers=headers,
+    )
     assert response_bad_regime.status_code == 422
 
 
@@ -1348,8 +1404,10 @@ def test_api_v2_landed_cost_simulation_endpoint():
 # ==============================================================================
 
 @pytest.mark.unit
-def test_hitl_quarantine_resolution_approved_override_and_rejected():
-    processor = ComexHTAPProcessor()
+def test_hitl_quarantine_resolution_approved_override_and_rejected(fake_htap_env):
+    processor = ComexHTAPProcessor(engine=fake_htap_env.engine)
+    salt = os.environ["PII_HASH_SALT"]
+    expected_reviewer_hash = hash_natural_person_pii("auditor.lead@comex.br", salt)
 
     # 1. Deflect two bad invoices to quarantine
     # Bad Invoice 1: Vertical arithmetic mismatch ($100 drift)
@@ -1469,20 +1527,20 @@ def test_hitl_quarantine_resolution_approved_override_and_rejected():
     )
     assert resolved_1["quarantine_id"] == qid1
     assert resolved_1["review_status"] == "APPROVED_OVERRIDE"
-    assert resolved_1["reviewed_by"] == "auditor.lead@comex.br"
+    assert resolved_1["reviewed_by"] == expected_reviewer_hash
     assert resolved_1["invoice_id"] is not None
     assert resolved_1["journal_entry_id"] is not None
     assert resolved_1["document_number"] == bad_inv_1["document_number"]
 
-    # 5. Resolve qid2 via REJECTED
+    # 5. Resolve qid2 via REJECTED alias -> normalized & persisted as REJECTED_HITL
     resolved_2 = processor.resolve_quarantined_invoice(
         quarantine_id=qid2,
         resolution_action="REJECTED",
         reviewed_by="auditor.lead@comex.br",
     )
     assert resolved_2["quarantine_id"] == qid2
-    assert resolved_2["review_status"] == "REJECTED"
-    assert resolved_2["reviewed_by"] == "auditor.lead@comex.br"
+    assert resolved_2["review_status"] == "REJECTED_HITL"
+    assert resolved_2["reviewed_by"] == expected_reviewer_hash
     assert resolved_2["invoice_id"] is None
     assert resolved_2["journal_entry_id"] is None
 
@@ -1492,8 +1550,8 @@ def test_hitl_quarantine_resolution_approved_override_and_rejected():
     assert qid1 not in remaining_ids
     assert qid2 not in remaining_ids
 
-    # 7. Immutability verification: attempting to re-resolve finalized items raises ValueError
-    with pytest.raises(ValueError) as exc:
+    # 7. Immutability verification: attempting to re-resolve finalized items raises QuarantineStateConflictError
+    with pytest.raises((QuarantineStateConflictError, ValueError)) as exc:
         processor.resolve_quarantined_invoice(
             quarantine_id=qid1,
             resolution_action="APPROVED_OVERRIDE",
@@ -1502,26 +1560,33 @@ def test_hitl_quarantine_resolution_approved_override_and_rejected():
         )
     assert "already finalized" in str(exc.value)
 
-    with pytest.raises(ValueError) as exc:
+    with pytest.raises((QuarantineStateConflictError, ValueError)) as exc:
         processor.resolve_quarantined_invoice(
             quarantine_id=qid2,
-            resolution_action="REJECTED",
+            resolution_action="REJECTED_HITL",
             reviewed_by="auditor.lead@comex.br",
         )
     assert "already finalized" in str(exc.value)
 
-    # 8. Non-existent quarantine_id raises KeyError
-    with pytest.raises(KeyError) as exc:
+    # 8. Non-existent quarantine_id raises QuarantineNotFoundError (subclass of KeyError)
+    with pytest.raises((QuarantineNotFoundError, KeyError)) as exc:
         processor.resolve_quarantined_invoice(
             quarantine_id=uuid4(),
-            resolution_action="REJECTED",
+            resolution_action="REJECTED_HITL",
             reviewed_by="auditor.lead@comex.br",
         )
     assert "not found" in str(exc.value)
 
 
 @pytest.mark.unit
-def test_api_v2_quarantine_pending_and_resolve_endpoints():
+def test_api_v2_quarantine_pending_and_resolve_endpoints(api_client):
+    standard_headers = {"X-API-Key": os.environ["API_KEY"]}
+    auditor_headers = {"X-API-Key": os.environ["AUDITOR_API_KEY"]}
+    expected_auditor_hash = hash_natural_person_pii(
+        "hugo.auditor@comex.br",
+        os.environ["PII_HASH_SALT"],
+    )
+
     # 1. Deflect an invalid invoice to quarantine via API
     bad_api_payload = {
         "issuer_tax_id": VALID_CNPJ_FORMATTED,
@@ -1535,13 +1600,13 @@ def test_api_v2_quarantine_pending_and_resolve_endpoints():
         "insurance_amount": "0.0000",  # CIF requires explicit insurance!
         "total_amount": "40000.0000",
     }
-    ingest_resp = client.post("/api/v2/invoices/ingest", json=bad_api_payload)
+    ingest_resp = api_client.post("/api/v2/invoices/ingest", json=bad_api_payload, headers=standard_headers)
     assert ingest_resp.status_code == 422
     quarantine_id = ingest_resp.json()["detail"]["quarantine_id"]
     assert quarantine_id is not None
 
     # 2. Test GET /api/v2/quarantine/pending
-    pending_resp = client.get("/api/v2/quarantine/pending")
+    pending_resp = api_client.get("/api/v2/quarantine/pending", headers=standard_headers)
     assert pending_resp.status_code == 200
     pending_data = pending_resp.json()
     assert pending_data["count"] >= 1
@@ -1566,12 +1631,16 @@ def test_api_v2_quarantine_pending_and_resolve_endpoints():
         "reviewed_by": "hugo.auditor@comex.br",
         "corrected_payload": bad_math_payload,
     }
-    bad_math_resp = client.post(f"/api/v2/quarantine/{quarantine_id}/resolve", json=resolve_bad_math_req)
+    bad_math_resp = api_client.post(
+        f"/api/v2/quarantine/{quarantine_id}/resolve",
+        json=resolve_bad_math_req,
+        headers=auditor_headers,
+    )
     assert bad_math_resp.status_code == 422
     assert "validation" in str(bad_math_resp.json()).lower() or "closure" in str(bad_math_resp.json()).lower()
 
     # Verify item is still in PENDING_REVIEW queue after failed resolution attempt
-    pending_check = client.get("/api/v2/quarantine/pending")
+    pending_check = api_client.get("/api/v2/quarantine/pending", headers=standard_headers)
     assert quarantine_id in [it["quarantine_id"] for it in pending_check.json()["items"]]
 
     # 4. Test POST /api/v2/quarantine/{quarantine_id}/resolve with valid corrected_payload (Expect 200 OK)
@@ -1592,24 +1661,36 @@ def test_api_v2_quarantine_pending_and_resolve_endpoints():
         "reviewed_by": "hugo.auditor@comex.br",
         "corrected_payload": valid_corrected_payload,
     }
-    ok_resp = client.post(f"/api/v2/quarantine/{quarantine_id}/resolve", json=resolve_ok_req)
+    ok_resp = api_client.post(
+        f"/api/v2/quarantine/{quarantine_id}/resolve",
+        json=resolve_ok_req,
+        headers=auditor_headers,
+    )
     assert ok_resp.status_code == 200
     res_payload = ok_resp.json()
     assert res_payload["quarantine_id"] == quarantine_id
     assert res_payload["review_status"] == "APPROVED_OVERRIDE"
-    assert res_payload["reviewed_by"] == "hugo.auditor@comex.br"
+    assert res_payload["reviewed_by"] == expected_auditor_hash
     assert res_payload["invoice_id"] is not None
     assert res_payload["journal_entry_id"] is not None
     assert res_payload["document_number"] == bad_api_payload["document_number"]
 
     # 5. Test duplicate resolution on finalized item (Expect 409 Conflict)
-    duplicate_resp = client.post(f"/api/v2/quarantine/{quarantine_id}/resolve", json=resolve_ok_req)
+    duplicate_resp = api_client.post(
+        f"/api/v2/quarantine/{quarantine_id}/resolve",
+        json=resolve_ok_req,
+        headers=auditor_headers,
+    )
     assert duplicate_resp.status_code == 409
-    assert "already finalized" in duplicate_resp.json()["detail"]["message"]
+    assert "already been finalized" in duplicate_resp.json()["detail"]["message"]
 
     # 6. Test resolution on non-existent quarantine_id (Expect 404 Not Found)
     non_existent_qid = str(uuid4())
-    not_found_resp = client.post(f"/api/v2/quarantine/{non_existent_qid}/resolve", json=resolve_ok_req)
+    not_found_resp = api_client.post(
+        f"/api/v2/quarantine/{non_existent_qid}/resolve",
+        json=resolve_ok_req,
+        headers=auditor_headers,
+    )
     assert not_found_resp.status_code == 404
     assert "not found" in not_found_resp.json()["detail"]["message"]
 

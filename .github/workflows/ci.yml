@@ -23,25 +23,106 @@ jobs:
       - name: Set up Environment Variables
         run: cp .env.example .env
 
-      - name: Start PostgreSQL 16 & MongoDB 7 (Docker Compose)
+      - name: Start PostgreSQL 16 & MongoDB 7 (Wait Until Both Healthy)
         run: |
-          docker compose up -d
-          # Aguarda os containers ficarem saudáveis
-          timeout 30s bash -c 'until docker compose ps | grep -q "(healthy)"; do sleep 2; done'
+          docker compose up -d postgres mongodb
+          timeout 90s bash -c '
+            until [ "$(docker inspect --format="{{.State.Health.Status}}" comex_postgres_v2 2>/dev/null)" = "healthy" ] && \
+                  [ "$(docker inspect --format="{{.State.Health.Status}}" comex_mongodb_v2 2>/dev/null)" = "healthy" ]; do
+              sleep 2
+            done
+          '
           docker compose ps
 
-      - name: Sync Virtual Environment (.venv)
-        run: uv sync
+      - name: Sync Virtual Environment (.venv --frozen)
+        run: uv sync --frozen
+
+      - name: Gate 0 — Ruff Code Quality & Style Check
+        run: uv run ruff check .
 
       - name: Gate 1 — Lint Executable Data Contracts (ODCS v3.2.0)
-        run: |
-          uv run datacontract lint ./contracts/canonical_document_v1.odcs.yaml
-          uv run datacontract lint ./contracts/comex_fiduciary_engine_v2.odcs.yaml
+        run: make contract-lint
 
-      - name: Gate 2 — Seed Multi-Model Databases (Postgres, Mongo, DuckDB)
-        run: |
-          uv run python -m src.seed
+      - name: Gate 2 — Apply Alembic Migrations (PostgreSQL 16)
+        run: uv run alembic upgrade head
 
-      - name: Gate 3 — Run PyTest Suite (Unit, Mathematical & Integration Tests)
+      - name: Gate 3 — Double-Seed Multi-Model Databases & Verify Zero Duplication
         run: |
-          uv run pytest tests/ -v
+          make seed
+          uv run python - <<'PY'
+          import json
+          from sqlalchemy import text
+          from src.connectors.postgres import engine
+
+          tables = [
+              "accounts",
+              "commercial_invoices",
+              "commercial_invoice_lines",
+              "journal_entries",
+              "journal_lines",
+              "comex_quarantine_hitl",
+              "ingestion_idempotency_registry",
+              "dim_date",
+              "dim_merchandise_ncm",
+              "dim_partner_country",
+              "dim_currency_ptax",
+              "fact_comex_operations",
+              "customs_nationalizations",
+          ]
+          with engine.connect() as conn:
+              counts = {t: conn.execute(text(f"SELECT COUNT(*) FROM {t}")).scalar_one() for t in tables}
+          with open("/tmp/seed_counts_1.json", "w", encoding="utf-8") as f:
+              json.dump(counts, f)
+          print("Seed #1 counts:", counts)
+          assert counts["accounts"] >= 13 and counts["commercial_invoices"] >= 1, counts
+          PY
+          make seed
+          uv run python - <<'PY'
+          import json
+          from sqlalchemy import text
+          from src.connectors.postgres import engine
+
+          with open("/tmp/seed_counts_1.json", "r", encoding="utf-8") as f:
+              before = json.load(f)
+          with engine.connect() as conn:
+              after = {t: conn.execute(text(f"SELECT COUNT(*) FROM {t}")).scalar_one() for t in before}
+          print("Seed #2 counts:", after)
+          assert before == after, f"Seed idempotency violated! before={before}, after={after}"
+          PY
+
+      - name: Gate 4 — Validate Live SQL Audit, Sabotage & DuckDB Lakehouse Queries
+        run: |
+          set -euo pipefail
+          for sql_file in sql/queries/0[1-7]_*.sql; do
+            echo "Running PostgreSQL check: $sql_file"
+            docker compose exec -T postgres psql -U comex_user -d comex_fiduciary_db -v ON_ERROR_STOP=1 -f - < "$sql_file"
+          done
+          echo "Running DuckDB Lakehouse views validation: sql/queries/00_init_duckdb_views.sql"
+          uv run python - <<'PY'
+          from pathlib import Path
+          from src.connectors.lakehouse import duckdb_connection
+
+          sql_script = Path("sql/queries/00_init_duckdb_views.sql").read_text(encoding="utf-8")
+          with duckdb_connection() as con:
+              rows = con.execute(sql_script).fetchall()
+              print(f"DuckDB fact_comex_operations rows: {len(rows)}")
+              assert len(rows) > 0, "Expected seeded rows in DuckDB fact_comex_operations view"
+          PY
+
+      - name: Gate 5 — Run Full PyTest Suite (Zero Skipped Tests Permitted)
+        run: |
+          uv run pytest tests/ -v --junitxml=/tmp/pytest-report.xml
+          uv run python - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          tree = ET.parse("/tmp/pytest-report.xml")
+          suites = [tree.getroot()] if tree.getroot().tag == "testsuite" else tree.getroot().findall("testsuite")
+          total_tests = sum(int(s.attrib.get("tests", 0)) for s in suites)
+          total_skipped = sum(int(s.attrib.get("skipped", 0)) for s in suites)
+          total_failures = sum(int(s.attrib.get("failures", 0)) for s in suites)
+          total_errors = sum(int(s.attrib.get("errors", 0)) for s in suites)
+          print(f"PyTest XML Summary: tests={total_tests}, skipped={total_skipped}, failures={total_failures}, errors={total_errors}")
+          assert total_tests > 0, "No tests executed"
+          assert total_skipped == 0, f"Skipped tests are forbidden in CI: {total_skipped} skipped"
+          assert total_failures == 0 and total_errors == 0
+          PY
